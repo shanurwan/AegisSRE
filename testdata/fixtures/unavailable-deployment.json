@@ -1,0 +1,83 @@
+{
+  "metrics": {
+    "deployment_unavailable": [
+      {
+        "labels": {
+          "namespace": "outage-arena",
+          "deployment": "demo-api"
+        },
+        "timestamp": "2026-09-30T00:00:00Z",
+        "value": 1
+      }
+    ],
+    "deployment_available": [
+      {
+        "labels": {
+          "namespace": "outage-arena",
+          "deployment": "demo-api"
+        },
+        "timestamp": "2026-09-30T00:00:00Z",
+        "value": 0
+      }
+    ]
+  },
+  "snapshot": {
+    "target": {
+      "api_version": "apps/v1",
+      "kind": "Deployment",
+      "namespace": "outage-arena",
+      "name": "demo-api"
+    },
+    "resource_version": "fixture-rv-before",
+    "generation": 7,
+    "observed_generation": 7,
+    "desired_replicas": 1,
+    "ready_replicas": 0,
+    "available_replicas": 0,
+    "unavailable_replicas": 1,
+    "selector": "app=demo-api",
+    "pods": [
+      {
+        "name": "demo-api-7d9f6d6c8b-demo1",
+        "phase": "Running",
+        "ready": false,
+        "node": "laboratory",
+        "created_at": "2026-09-30T00:00:00Z",
+        "containers": [
+          {
+            "name": "demo-api",
+            "ready": false,
+            "restart_count": 0,
+            "reason": "ReadinessProbeFailed",
+            "message": "HTTP readiness probe returned status 503"
+          }
+        ]
+      }
+    ],
+    "events": [
+      {
+        "type": "Warning",
+        "reason": "Unhealthy",
+        "message": "Readiness probe failed: HTTP probe returned statuscode: 503",
+        "object": "pod/demo-api-7d9f6d6c8b-demo1",
+        "count": 4,
+        "last_seen": "2026-09-30T00:00:15Z"
+      }
+    ],
+    "observed_at": "2026-09-30T00:00:15Z"
+  },
+  "pod_logs": {
+    "demo-api-7d9f6d6c8b-demo1": "2026-09-30T00:00:14Z WARN dependency health check timed out\n"
+  },
+  "logs": [
+    {
+      "timestamp": "2026-09-30T00:00:14Z",
+      "message": "dependency health check timed out",
+      "labels": {
+        "kubernetes.pod_namespace": "outage-arena",
+        "kubernetes.pod_name": "demo-api-7d9f6d6c8b-demo1"
+      }
+    }
+  ]
+}
+

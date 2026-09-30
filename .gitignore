@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.env
+*.log
+dist/
+build/
+*.egg-info/
+.DS_Store
+.idea/
+.vscode/
+
+# Local delegation credentials
+*.pem
+*.key
+deploy/kubernetes/base/secret.yaml

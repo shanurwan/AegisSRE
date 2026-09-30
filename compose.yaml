@@ -1,0 +1,116 @@
+# Local, deterministic fixture topology. It starts diagnosis-only by default:
+# AEGIS_DRY_RUN=true, AEGIS_ALLOW_MUTATIONS=false, and no delegation keys.
+# Run `aegissre keygen` and inject both printed values to exercise delegation.
+x-aegis-environment: &aegis-environment
+  AEGIS_LISTEN_ADDR: ":8080"
+  AEGIS_ALLOWED_NAMESPACE: outage-arena
+  AEGIS_BACKEND: fixture
+  AEGIS_FIXTURE_PATH: /fixtures/unavailable-deployment.json
+  AEGIS_DRY_RUN: "${AEGIS_DRY_RUN:-true}"
+  AEGIS_ALLOW_MUTATIONS: "${AEGIS_ALLOW_MUTATIONS:-false}"
+  AEGIS_SCAN_INTERVAL: "${AEGIS_SCAN_INTERVAL:-5s}"
+  AEGIS_VERIFICATION_COUNT: "${AEGIS_VERIFICATION_COUNT:-2}"
+  AEGIS_INCIDENT_COOLDOWN: "${AEGIS_INCIDENT_COOLDOWN:-1m}"
+  AEGIS_REQUEST_TIMEOUT: "${AEGIS_REQUEST_TIMEOUT:-10s}"
+  AEGIS_EVIDENCE_BUDGET: "${AEGIS_EVIDENCE_BUDGET:-6}"
+  AEGIS_MAX_LOG_BYTES: "${AEGIS_MAX_LOG_BYTES:-32768}"
+  AEGIS_DELEGATION_TTL: "${AEGIS_DELEGATION_TTL:-2m}"
+  AEGIS_MAX_SCALE_REPLICAS: "${AEGIS_MAX_SCALE_REPLICAS:-20}"
+  AEGIS_MAX_SCALE_INCREASE: "${AEGIS_MAX_SCALE_INCREASE:-5}"
+  AEGIS_DELEGATION_KEY_ID: "${AEGIS_DELEGATION_KEY_ID:-aegissre-monitor-v1}"
+  AEGIS_OBSERVE_MCP_URL: http://aegis-mcp-read:8080/mcp
+  AEGIS_OPERATE_MCP_URL: http://aegis-mcp-action:8080/mcp
+  AEGIS_INVESTIGATOR_URL: http://aegis-investigator:8080
+  AEGIS_OPERATOR_URL: http://aegis-operator:8080
+
+x-aegis-service: &aegis-service
+  build:
+    context: .
+    target: runtime
+  image: aegissre:local
+  init: true
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  cap_drop: ["ALL"]
+  security_opt:
+    - no-new-privileges:true
+  stop_grace_period: 15s
+
+services:
+  aegis-mcp-read:
+    <<: *aegis-service
+    command: ["mcp-server", "--profile=read"]
+    environment:
+      <<: *aegis-environment
+      AEGIS_PUBLIC_URL: http://aegis-mcp-read:8080
+    volumes:
+      - ./testdata/fixtures:/fixtures:ro
+    networks: [observe]
+    ports:
+      - "127.0.0.1:8084:8080"
+
+  aegis-mcp-action:
+    <<: *aegis-service
+    command: ["mcp-server", "--profile=action"]
+    environment:
+      <<: *aegis-environment
+      AEGIS_PUBLIC_URL: http://aegis-mcp-action:8080
+      AEGIS_DELEGATION_PUBLIC_KEY: "${AEGIS_DELEGATION_PUBLIC_KEY:-}"
+    volumes:
+      - ./testdata/fixtures:/fixtures:ro
+    networks: [operate]
+    ports:
+      - "127.0.0.1:8085:8080"
+
+  aegis-investigator:
+    <<: *aegis-service
+    command: ["investigator"]
+    depends_on:
+      - aegis-mcp-read
+    environment:
+      <<: *aegis-environment
+      AEGIS_PUBLIC_URL: http://aegis-investigator:8080
+      AEGIS_LLM_BASE_URL: "${AEGIS_LLM_BASE_URL:-}"
+      AEGIS_LLM_API_KEY: "${AEGIS_LLM_API_KEY:-}"
+      AEGIS_LLM_MODEL: "${AEGIS_LLM_MODEL:-}"
+    networks: [observe]
+    ports:
+      - "127.0.0.1:8082:8080"
+
+  aegis-operator:
+    <<: *aegis-service
+    command: ["operator"]
+    depends_on:
+      - aegis-mcp-action
+    environment:
+      <<: *aegis-environment
+      AEGIS_PUBLIC_URL: http://aegis-operator:8080
+      AEGIS_DELEGATION_PUBLIC_KEY: "${AEGIS_DELEGATION_PUBLIC_KEY:-}"
+    networks: [control, operate]
+    ports:
+      - "127.0.0.1:8083:8080"
+
+  aegis-monitor:
+    <<: *aegis-service
+    command: ["monitor"]
+    depends_on:
+      - aegis-mcp-read
+      - aegis-investigator
+      - aegis-operator
+    environment:
+      <<: *aegis-environment
+      AEGIS_PUBLIC_URL: http://aegis-monitor:8080
+      AEGIS_DELEGATION_PRIVATE_KEY: "${AEGIS_DELEGATION_PRIVATE_KEY:-}"
+    networks: [observe, control]
+    ports:
+      - "127.0.0.1:8081:8080"
+
+networks:
+  observe:
+    name: aegissre-observe
+  control:
+    name: aegissre-control
+  operate:
+    name: aegissre-operate

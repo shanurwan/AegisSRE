@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: outage-arena
+resources:
+  - serviceaccounts.yaml
+  - rbac.yaml
+  - monitor.yaml
+  - investigator.yaml
+  - operator.yaml
+  - mcp-read.yaml
+  - mcp-action.yaml
+  - networkpolicies.yaml
+configMapGenerator:
+  - name: aegis-config
+    envs:
+      - config.env
+images:
+  - name: ghcr.io/shanurwan/aegissre
+    newTag: latest
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: aegissre

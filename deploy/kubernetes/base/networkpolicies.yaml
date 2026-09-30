@@ -1,0 +1,206 @@
+# All AegisSRE pods start isolated. The policies below encode the only runtime
+# graph: Monitor -> Investigator, Monitor -> Operator, Monitor/Investigator ->
+# read MCP, and Operator -> action MCP. In particular, Investigator cannot
+# reach Operator or the action MCP adapter.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-default-deny
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: aegissre
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-investigator-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-investigator
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: aegis-monitor
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-operator-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-operator
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: aegis-monitor
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-mcp-read-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-mcp-read
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values: ["aegis-monitor", "aegis-investigator"]
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-mcp-action-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-mcp-action
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: aegis-operator
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# DNS is shared by every component. Restricting it to kube-system avoids broad
+# same-namespace egress while remaining compatible with CoreDNS in k3s.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-dns-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: aegissre
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-monitor-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-monitor
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values: ["aegis-investigator", "aegis-operator", "aegis-mcp-read"]
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-investigator-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-investigator
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: aegis-mcp-read
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-operator-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-operator
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: aegis-mcp-action
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# outage-arena's k3s service CIDR is 10.43.0.0/16; kubernetes.default is its
+# first address. If that Terraform input changes, patch this CIDR as well.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-mcp-kubernetes-api-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values: ["aegis-mcp-read", "aegis-mcp-action"]
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.43.0.1/32
+      ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-mcp-read-telemetry-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-mcp-read
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - protocol: TCP
+          port: 8428
+        - protocol: TCP
+          port: 9428

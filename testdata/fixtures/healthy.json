@@ -1,0 +1,27 @@
+{
+  "metrics": {
+    "deployment_unavailable": []
+  },
+  "snapshot": {
+    "target": {
+      "api_version": "apps/v1",
+      "kind": "Deployment",
+      "namespace": "outage-arena",
+      "name": "demo-api"
+    },
+    "resource_version": "fixture-rv-healthy",
+    "generation": 1,
+    "observed_generation": 1,
+    "desired_replicas": 1,
+    "ready_replicas": 1,
+    "available_replicas": 1,
+    "unavailable_replicas": 0,
+    "selector": "app=demo-api",
+    "pods": [],
+    "events": [],
+    "observed_at": "2026-09-30T00:00:00Z"
+  },
+  "pod_logs": {},
+  "logs": []
+}
+

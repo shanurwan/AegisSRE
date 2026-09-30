@@ -1,0 +1,57 @@
+# Only the read MCP adapter talks to the exact Kubernetes read APIs exercised
+# by its current adapter. Monitor and Investigator have no Kubernetes
+# credentials and must use constrained MCP.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aegis-mcp-read
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aegis-mcp-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: aegis-mcp-read
+subjects:
+  - kind: ServiceAccount
+    name: aegis-mcp-read
+---
+# The action MCP adapter can inspect one Deployment and perform only the two
+# implemented Deployment merge-patch shapes (restart or bounded scale). It
+# cannot list, watch, create, delete, exec, read Secrets, or access
+# cluster-scoped resources.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aegis-mcp-action
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aegis-mcp-action
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: aegis-mcp-action
+subjects:
+  - kind: ServiceAccount
+    name: aegis-mcp-action
