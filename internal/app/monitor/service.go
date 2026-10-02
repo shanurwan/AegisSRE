@@ -1,12 +1,15 @@
 package monitor
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"sync"
 	"time"
 
@@ -90,9 +93,15 @@ type Service struct {
 	EvidenceBudget       int
 	DryRun               bool
 	AllowLogTraceActions bool
+	StateStore           ports.MonitorStateStore
+	InstanceID           string
+	StateLease           time.Duration
 
-	mu      sync.Mutex
-	tracker map[string]*observation
+	scanMu      sync.Mutex
+	mu          sync.Mutex
+	tracker     map[string]*observation
+	leaseMu     sync.RWMutex
+	activeLease *ports.MonitorLease
 }
 
 type observation struct {
@@ -101,6 +110,8 @@ type observation struct {
 	Dispatched  time.Time
 	WorkloadKey string
 	Pending     *pendingVerification
+	Dispatch    *pendingDispatch
+	Report      *pendingReport
 }
 
 type pendingVerification struct {
@@ -114,13 +125,86 @@ type pendingVerification struct {
 	CausationID   string
 }
 
+type pendingDispatch struct {
+	Incident  model.Incident
+	Diagnosis model.DiagnosisReport
+	Grant     model.DelegationGrant
+	Target    model.ResourceTarget
+	Envelope  model.Envelope
+	StartedAt time.Time
+}
+
+type pendingReport struct {
+	Outcome          IncidentOutcome
+	Target           model.ResourceTarget
+	Request          model.IncidentReportRequest
+	Envelope         model.Envelope
+	ExpectedReportID string
+}
+
+type durableMonitorState struct {
+	SchemaVersion string                  `json:"schema_version"`
+	Tracker       map[string]*observation `json:"tracker"`
+}
+
 const (
 	maxTrackedIncidents    = 4096
 	maxDetectionSamples    = 50
 	maxExactDetectionCount = 1<<53 - 1
+	monitorStateSchemaV2   = "aegissre.io/monitor-state/v2"
 )
 
 func (s *Service) Scan(ctx context.Context, request ScanRequest) (ScanResult, error) {
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+	if s.StateStore == nil {
+		return s.scan(ctx, request)
+	}
+	if s.Clock == nil {
+		return ScanResult{}, errors.New("monitor clock is required for durable coordination")
+	}
+	if s.InstanceID == "" {
+		return ScanResult{}, errors.New("monitor instance ID is required for durable coordination")
+	}
+	leaseDuration := s.stateLease()
+	lease, acquired, err := s.StateStore.AcquireMonitorLease(ctx, s.Namespace, s.InstanceID, leaseDuration)
+	if err != nil {
+		return ScanResult{}, fmt.Errorf("acquire monitor leadership: %w", err)
+	}
+	if !acquired {
+		return ScanResult{ScannedAt: s.Clock.Now().UTC()}, nil
+	}
+	checkpoint, exists, err := s.StateStore.LoadMonitorCheckpoint(ctx, lease)
+	if err != nil {
+		return ScanResult{}, fmt.Errorf("load monitor checkpoint: %w", err)
+	}
+	if exists {
+		if err := s.restoreCheckpoint(checkpoint.Payload); err != nil {
+			return ScanResult{}, fmt.Errorf("restore monitor checkpoint: %w", err)
+		}
+	} else {
+		s.mu.Lock()
+		s.tracker = make(map[string]*observation)
+		s.mu.Unlock()
+	}
+	s.setActiveLease(&lease)
+	defer s.setActiveLease(nil)
+
+	scanContext, cancel := context.WithCancelCause(ctx)
+	heartbeatDone := make(chan error, 1)
+	go s.maintainLease(scanContext, leaseDuration, cancel, heartbeatDone)
+	result, scanErr := s.scan(scanContext, request)
+	if persistErr := s.persistCheckpoint(ctx); persistErr != nil {
+		scanErr = errors.Join(scanErr, fmt.Errorf("persist monitor checkpoint: %w", persistErr))
+	}
+	cancel(nil)
+	if heartbeatErr := <-heartbeatDone; heartbeatErr != nil {
+		scanErr = errors.Join(scanErr, heartbeatErr)
+	}
+	return result, scanErr
+}
+
+func (s *Service) scan(ctx context.Context, request ScanRequest) (ScanResult, error) {
 	if s.Tools == nil || s.Peers == nil || s.Clock == nil || s.IDs == nil {
 		return ScanResult{}, errors.New("monitor dependencies are incomplete")
 	}
@@ -139,14 +223,28 @@ func (s *Service) Scan(ctx context.Context, request ScanRequest) (ScanResult, er
 	result := ScanResult{ScannedAt: now}
 	seen := make(map[string]struct{})
 	pendingChecked := make(map[string]struct{})
+	var scanErrors []error
+	for _, key := range s.workflowKeys() {
+		outcome, handled, err := s.resumeWorkflow(ctx, key, now)
+		if !handled {
+			continue
+		}
+		result.Outcomes = append(result.Outcomes, outcome)
+		pendingChecked[key] = struct{}{}
+		if err != nil {
+			scanErrors = append(scanErrors, fmt.Errorf("resume durable workflow %s: %w", key, err))
+		}
+	}
 	for _, key := range s.pendingNotSeen(nil) {
+		if _, recovered := pendingChecked[key]; recovered {
+			continue
+		}
 		if outcome, pending := s.verifyPending(ctx, key, now); pending {
 			result.Outcomes = append(result.Outcomes, outcome)
 			pendingChecked[key] = struct{}{}
 		}
 	}
 
-	var scanErrors []error
 	succeeded := 0
 	for _, rule := range rules {
 		source, err := ruleEvidenceSource(rule)
@@ -168,6 +266,10 @@ func (s *Service) Scan(ctx context.Context, request ScanRequest) (ScanResult, er
 			if deployment == "" || sample.Namespace != namespace {
 				continue
 			}
+			target := model.ResourceTarget{APIVersion: "apps/v1", Kind: "Deployment", Namespace: sample.Namespace, Name: deployment}
+			if binding, ok := s.Policy.(ports.WorkloadPolicyBinding); ok && binding.RequiresBinding() && !binding.AllowsSignal(target, source) {
+				continue
+			}
 			confirmationKey := fingerprint(rule.ID, namespace, deployment)
 			workloadKey := workloadFingerprint(namespace, deployment)
 			if _, duplicate := seen[confirmationKey]; duplicate {
@@ -176,6 +278,9 @@ func (s *Service) Scan(ctx context.Context, request ScanRequest) (ScanResult, er
 			seen[confirmationKey] = struct{}{}
 			result.Candidates++
 			if _, checked := pendingChecked[workloadKey]; checked {
+				continue
+			}
+			if s.hasWorkflow(workloadKey) {
 				continue
 			}
 			if outcome, pending := s.verifyPending(ctx, workloadKey, now); pending {
@@ -215,6 +320,249 @@ func (s *Service) Scan(ctx context.Context, request ScanRequest) (ScanResult, er
 		s.resetConfirmations(now)
 	}
 	return result, errors.Join(scanErrors...)
+}
+
+func (s *Service) maintainLease(
+	ctx context.Context,
+	duration time.Duration,
+	cancel context.CancelCauseFunc,
+	done chan<- error,
+) {
+	interval := duration / 3
+	if interval < time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			done <- nil
+			return
+		case <-ticker.C:
+			lease, ok := s.currentLease()
+			if !ok {
+				err := errors.New("monitor leadership lease disappeared")
+				cancel(err)
+				done <- err
+				return
+			}
+			renewed, err := s.StateStore.RenewMonitorLease(ctx, lease, duration)
+			if err != nil {
+				err = fmt.Errorf("renew monitor leadership: %w", err)
+				cancel(err)
+				done <- err
+				return
+			}
+			s.setActiveLease(&renewed)
+		}
+	}
+}
+
+func (s *Service) persistCheckpoint(ctx context.Context) error {
+	if s.StateStore == nil {
+		return nil
+	}
+	lease, ok := s.currentLease()
+	if !ok {
+		return errors.New("monitor leadership lease is unavailable")
+	}
+	s.mu.Lock()
+	payload, err := json.Marshal(durableMonitorState{SchemaVersion: monitorStateSchemaV2, Tracker: s.tracker})
+	s.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("marshal monitor checkpoint: %w", err)
+	}
+	_, err = s.StateStore.SaveMonitorCheckpoint(ctx, lease, payload)
+	return err
+}
+
+func (s *Service) restoreCheckpoint(payload []byte) error {
+	var state durableMonitorState
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&state); err != nil {
+		return model.WrapError(model.CodeInvalidInput, "decode durable monitor state", err)
+	}
+	if state.SchemaVersion != monitorStateSchemaV2 || state.Tracker == nil || len(state.Tracker) > maxTrackedIncidents {
+		return model.NewError(model.CodeInvalidInput, "durable monitor state has an unsupported schema or size")
+	}
+	for key, item := range state.Tracker {
+		if err := validateDurableObservation(key, item); err != nil {
+			return err
+		}
+	}
+	s.mu.Lock()
+	s.tracker = state.Tracker
+	s.mu.Unlock()
+	return nil
+}
+
+func validateDurableObservation(key string, item *observation) error {
+	if !validFingerprint(key) || item == nil || !validFingerprint(item.WorkloadKey) ||
+		item.Consecutive < 0 || item.Consecutive > 10 {
+		return model.NewError(model.CodeInvalidInput, "durable monitor state contains an invalid observation")
+	}
+	active := 0
+	if item.Pending != nil {
+		active++
+	}
+	if item.Dispatch != nil {
+		active++
+	}
+	if item.Report != nil {
+		active++
+	}
+	if active > 1 {
+		return model.NewError(model.CodeInvalidInput, "durable monitor observation contains conflicting workflow stages")
+	}
+	if pending := item.Pending; pending != nil {
+		if err := pending.Incident.Validate(); err != nil {
+			return model.WrapError(model.CodeInvalidInput, "durable pending incident is invalid", err)
+		}
+		if err := pending.Diagnosis.VerifyDigest(); err != nil {
+			return model.WrapError(model.CodeInvalidInput, "durable pending diagnosis is invalid", err)
+		}
+		if err := pending.Grant.ValidateSigned(); err != nil {
+			return model.WrapError(model.CodeInvalidInput, "durable pending grant is invalid", err)
+		}
+		if err := pending.Receipt.Validate(); err != nil {
+			return model.WrapError(model.CodeInvalidInput, "durable pending receipt is invalid", err)
+		}
+		if !pending.Target.Equal(pending.Grant.Action.Target) ||
+			pending.Incident.ID != pending.Grant.IncidentID ||
+			pending.Diagnosis.ID != pending.Grant.DiagnosisReportID ||
+			pending.Diagnosis.Digest != pending.Grant.DiagnosisDigest ||
+			pending.Incident.DiagnosisReportID != pending.Diagnosis.ID ||
+			pending.Receipt.Outcome != model.ActionSucceeded || pending.StartedAt.IsZero() ||
+			validateReceiptForGrant(pending.Receipt, pending.Grant) != nil ||
+			item.WorkloadKey != workloadFingerprint(pending.Target.Namespace, pending.Target.Name) {
+			return model.NewError(model.CodeInvalidInput, "durable pending verification bindings are invalid")
+		}
+	}
+	if dispatch := item.Dispatch; dispatch != nil {
+		if err := dispatch.Incident.Validate(); err != nil {
+			return model.WrapError(model.CodeInvalidInput, "durable dispatch incident is invalid", err)
+		}
+		if err := dispatch.Diagnosis.VerifyDigest(); err != nil {
+			return model.WrapError(model.CodeInvalidInput, "durable dispatch diagnosis is invalid", err)
+		}
+		if err := dispatch.Grant.ValidateSigned(); err != nil {
+			return model.WrapError(model.CodeInvalidInput, "durable monitor dispatch grant is invalid", err)
+		}
+		if err := dispatch.Envelope.Validate(); err != nil {
+			return model.WrapError(model.CodeInvalidInput, "durable monitor dispatch envelope is invalid", err)
+		}
+		var envelopeGrant model.DelegationGrant
+		if err := dispatch.Envelope.DecodePayload(&envelopeGrant); err != nil || !sameJSON(envelopeGrant, dispatch.Grant) {
+			return model.NewError(model.CodeInvalidInput, "durable dispatch envelope differs from its signed grant")
+		}
+		if dispatch.Envelope.IncidentID != dispatch.Incident.ID ||
+			dispatch.Envelope.Sender != model.AgentMonitor || dispatch.Envelope.Recipient != model.AgentOperator ||
+			dispatch.Envelope.Kind != model.MessageRemediationRequest ||
+			!dispatch.Target.Equal(dispatch.Grant.Action.Target) ||
+			dispatch.Incident.ID != dispatch.Grant.IncidentID ||
+			dispatch.Diagnosis.ID != dispatch.Grant.DiagnosisReportID ||
+			dispatch.Diagnosis.Digest != dispatch.Grant.DiagnosisDigest ||
+			dispatch.Incident.DiagnosisReportID != dispatch.Diagnosis.ID || dispatch.StartedAt.IsZero() ||
+			item.WorkloadKey != workloadFingerprint(dispatch.Target.Namespace, dispatch.Target.Name) {
+			return model.NewError(model.CodeInvalidInput, "durable remediation dispatch bindings are invalid")
+		}
+	}
+	if report := item.Report; report != nil {
+		if err := report.Request.ValidateSigned(); err != nil {
+			return model.WrapError(model.CodeInvalidInput, "durable monitor report request is invalid", err)
+		}
+		if err := report.Envelope.Validate(); err != nil {
+			return model.WrapError(model.CodeInvalidInput, "durable monitor report envelope is invalid", err)
+		}
+		if err := report.Outcome.Incident.Validate(); err != nil || report.Outcome.Diagnosis == nil {
+			return model.NewError(model.CodeInvalidInput, "durable report outcome incident or diagnosis is invalid")
+		}
+		if err := report.Outcome.Diagnosis.VerifyDigest(); err != nil {
+			return model.WrapError(model.CodeInvalidInput, "durable report outcome diagnosis is invalid", err)
+		}
+		var envelopeRequest model.IncidentReportRequest
+		if err := report.Envelope.DecodePayload(&envelopeRequest); err != nil || !sameJSON(envelopeRequest, report.Request) {
+			return model.NewError(model.CodeInvalidInput, "durable report envelope differs from its signed request")
+		}
+		expectedID, err := report.Request.DeterministicReportID()
+		if err != nil || expectedID != report.ExpectedReportID ||
+			report.Envelope.IncidentID != report.Outcome.Incident.ID ||
+			report.Envelope.Sender != model.AgentMonitor || report.Envelope.Recipient != model.AgentOperator ||
+			report.Envelope.Kind != model.MessageIncidentReportRequest ||
+			!report.Target.Equal(report.Request.Target) ||
+			report.Request.IncidentID != report.Outcome.Incident.ID ||
+			report.Request.DiagnosisReportID != report.Outcome.Diagnosis.ID ||
+			report.Request.FinalState != report.Outcome.Incident.State ||
+			item.WorkloadKey != workloadFingerprint(report.Target.Namespace, report.Target.Name) {
+			return model.NewError(model.CodeInvalidInput, "durable incident report bindings are invalid")
+		}
+		switch {
+		case report.Request.GrantID == "":
+			if report.Request.ReceiptID != "" || report.Outcome.Receipt != nil {
+				return model.NewError(model.CodeInvalidInput, "durable receipt-free report contains execution evidence")
+			}
+		case report.Request.ReceiptID == "":
+			if report.Request.Reason != model.ReportReasonActionOutcomeUnverified &&
+				report.Request.Reason != model.ReportReasonAuthorityExceeded {
+				return model.NewError(model.CodeInvalidInput, "durable grant-only report reason is invalid")
+			}
+			if report.Outcome.Grant == nil || report.Outcome.Receipt != nil ||
+				report.Request.GrantID != report.Outcome.Grant.GrantID {
+				return model.NewError(model.CodeInvalidInput, "durable grant-only report binding is invalid")
+			}
+		default:
+			if report.Outcome.Grant == nil || report.Outcome.Receipt == nil ||
+				report.Request.GrantID != report.Outcome.Grant.GrantID ||
+				report.Request.ReceiptID != report.Outcome.Receipt.ReceiptID ||
+				validateReceiptForGrant(*report.Outcome.Receipt, *report.Outcome.Grant) != nil {
+				return model.NewError(model.CodeInvalidInput, "durable incident report receipt binding is invalid")
+			}
+		}
+	}
+	return nil
+}
+
+func validFingerprint(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func sameJSON(left, right any) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
+}
+
+func (s *Service) setActiveLease(lease *ports.MonitorLease) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if lease == nil {
+		s.activeLease = nil
+		return
+	}
+	copy := *lease
+	s.activeLease = &copy
+}
+
+func (s *Service) currentLease() (ports.MonitorLease, bool) {
+	s.leaseMu.RLock()
+	defer s.leaseMu.RUnlock()
+	if s.activeLease == nil {
+		return ports.MonitorLease{}, false
+	}
+	return *s.activeLease, true
+}
+
+func (s *Service) stateLease() time.Duration {
+	if s.StateLease < 5*time.Second || s.StateLease > 5*time.Minute {
+		return time.Minute
+	}
+	return s.StateLease
 }
 
 func ruleEvidenceSource(rule Rule) (model.EvidenceSource, error) {
@@ -473,6 +821,9 @@ func (s *Service) coordinate(ctx context.Context, signal model.IncidentSignal, d
 		DryRun: s.DryRun, IdempotencyKey: incident.ID + ":" + proposal.ID,
 		IssuedAt: issuedAt, NotBefore: issuedAt, ExpiresAt: issuedAt.Add(s.delegationTTL()),
 	}
+	if binding, ok := s.Policy.(ports.WorkloadPolicyBinding); ok && binding.RequiresBinding() {
+		grant.PolicyDigest = binding.BindingDigest()
+	}
 	if s.Signer == nil {
 		if err := incident.Transition(model.IncidentEscalated, s.Clock.Now()); err != nil {
 			return outcome, err
@@ -512,61 +863,108 @@ func (s *Service) coordinate(ctx context.Context, signal model.IncidentSignal, d
 	}
 	outcome.Incident = incident
 	outcome.Grant = &grant
-	failAfterGrant := func(failure error, correlationID, causationID string) (IncidentOutcome, error) {
-		if !incident.State.Terminal() {
-			if transitionErr := incident.Transition(model.IncidentEscalated, s.Clock.Now()); transitionErr != nil {
-				return outcome, transitionErr
-			}
-		}
-		outcome.Incident = incident
-		outcome.Status = "escalated"
-		outcome.Detail = "delegated remediation outcome could not be verified: " + failure.Error()
-		// No receipt is trusted on this path. The outcome-unverified report deliberately
-		// carries no execution reference, even if the peer returned malformed data.
-		s.attachIncidentReport(ctx, &outcome, target, correlationID, causationID, model.ReportReasonActionOutcomeUnverified)
-		return outcome, nil
-	}
 	grantEnvelope, err := model.NewEnvelope(
 		s.IDs.NewID(), incident.ID, requestEnvelope.CorrelationID, diagnosisEnvelope.MessageID,
 		model.AgentMonitor, model.AgentOperator, model.MessageRemediationRequest, s.Clock.Now(), grant,
 	)
 	if err != nil {
-		return failAfterGrant(err, requestEnvelope.CorrelationID, diagnosisEnvelope.MessageID)
+		return outcome, err
 	}
+	dispatch := pendingDispatch{
+		Incident: incident, Diagnosis: diagnosis, Grant: grant, Target: target,
+		Envelope: grantEnvelope, StartedAt: s.Clock.Now().UTC(),
+	}
+	if err := s.storeDispatch(ctx, signal.Fingerprint, dispatch); err != nil {
+		return outcome, fmt.Errorf("checkpoint delegated remediation before delivery: %w", err)
+	}
+	recovered, _, err := s.resumeDispatch(ctx, signal.Fingerprint, s.Clock.Now().UTC())
+	return recovered, err
+}
+
+func (s *Service) resumeWorkflow(ctx context.Context, key string, now time.Time) (IncidentOutcome, bool, error) {
+	s.mu.Lock()
+	item := s.tracker[key]
+	hasReport := item != nil && item.Report != nil
+	hasDispatch := item != nil && item.Dispatch != nil
+	s.mu.Unlock()
+	if hasReport {
+		return s.resumeReport(ctx, key)
+	}
+	if hasDispatch {
+		return s.resumeDispatch(ctx, key, now)
+	}
+	return IncidentOutcome{}, false, nil
+}
+
+func (s *Service) resumeDispatch(ctx context.Context, key string, now time.Time) (IncidentOutcome, bool, error) {
+	s.mu.Lock()
+	item := s.tracker[key]
+	if item == nil || item.Dispatch == nil {
+		s.mu.Unlock()
+		return IncidentOutcome{}, false, nil
+	}
+	dispatch := *item.Dispatch
+	s.mu.Unlock()
+	outcome := IncidentOutcome{
+		Incident: dispatch.Incident, Diagnosis: &dispatch.Diagnosis,
+		Grant: &dispatch.Grant, Status: "remediation_delivery_pending",
+	}
+	failAfterGrant := func(failure error, causationID string) (IncidentOutcome, bool, error) {
+		incident := dispatch.Incident
+		if !incident.State.Terminal() {
+			if transitionErr := incident.Transition(model.IncidentEscalated, s.Clock.Now()); transitionErr != nil {
+				return outcome, true, transitionErr
+			}
+		}
+		outcome.Incident = incident
+		outcome.Status = "escalated"
+		outcome.Detail = "delegated remediation outcome could not be verified: " + failure.Error()
+		// No receipt is trusted on this path. The report deliberately carries no
+		// execution reference, even if the peer returned malformed data.
+		s.attachIncidentReport(ctx, &outcome, dispatch.Target, dispatch.Envelope.CorrelationID, causationID, model.ReportReasonActionOutcomeUnverified)
+		return outcome, true, nil
+	}
+
 	var receiptEnvelope model.Envelope
-	if err := s.Peers.Send(ctx, s.OperatorURL, grantEnvelope, &receiptEnvelope); err != nil {
-		if reason, finalState, ok := reportableOperatorError(err); ok {
+	if err := s.Peers.Send(ctx, s.OperatorURL, dispatch.Envelope, &receiptEnvelope); err != nil {
+		if reason, finalState, reportable := reportableOperatorError(err); reportable {
+			incident := dispatch.Incident
 			if transitionErr := incident.Transition(finalState, s.Clock.Now()); transitionErr != nil {
-				return outcome, transitionErr
+				return outcome, true, transitionErr
 			}
 			outcome.Incident = incident
 			outcome.Status = string(finalState)
 			outcome.Detail = "Operator declined the delegated task: " + err.Error()
-			s.attachIncidentReport(ctx, &outcome, target, grantEnvelope.CorrelationID, grantEnvelope.MessageID, reason)
-			return outcome, nil
+			s.attachIncidentReport(ctx, &outcome, dispatch.Target, dispatch.Envelope.CorrelationID, dispatch.Envelope.MessageID, reason)
+			return outcome, true, nil
 		}
-		return failAfterGrant(fmt.Errorf("delegate remediation: %w", err), grantEnvelope.CorrelationID, grantEnvelope.MessageID)
+		if s.StateStore != nil && (now.Before(dispatch.StartedAt) || now.Sub(dispatch.StartedAt) < s.cooldown()) {
+			outcome.Detail = "exact delegated remediation will be retried after an ambiguous delivery failure: " + err.Error()
+			return outcome, true, nil
+		}
+		return failAfterGrant(fmt.Errorf("delegate remediation: %w", err), dispatch.Envelope.MessageID)
 	}
 	if err := validateResponse(
-		receiptEnvelope, incident.ID, grantEnvelope.CorrelationID, grantEnvelope.MessageID,
+		receiptEnvelope, dispatch.Incident.ID, dispatch.Envelope.CorrelationID, dispatch.Envelope.MessageID,
 		model.AgentOperator, model.AgentMonitor, model.MessageActionReceipt,
 	); err != nil {
-		return failAfterGrant(err, grantEnvelope.CorrelationID, grantEnvelope.MessageID)
+		return failAfterGrant(err, dispatch.Envelope.MessageID)
 	}
 	var receipt model.ActionReceipt
 	if err := receiptEnvelope.DecodePayload(&receipt); err != nil {
-		return failAfterGrant(err, grantEnvelope.CorrelationID, receiptEnvelope.MessageID)
+		return failAfterGrant(err, receiptEnvelope.MessageID)
 	}
 	if err := receipt.Validate(); err != nil {
-		return failAfterGrant(err, grantEnvelope.CorrelationID, receiptEnvelope.MessageID)
+		return failAfterGrant(err, receiptEnvelope.MessageID)
 	}
-	if err := validateReceiptForGrant(receipt, grant); err != nil {
-		return failAfterGrant(err, grantEnvelope.CorrelationID, receiptEnvelope.MessageID)
+	if err := validateReceiptForGrant(receipt, dispatch.Grant); err != nil {
+		return failAfterGrant(err, receiptEnvelope.MessageID)
 	}
 	outcome.Receipt = &receipt
 	outcome.Status = string(receipt.Outcome)
+	incident := dispatch.Incident
 	if err := incident.Transition(model.IncidentRemediating, s.Clock.Now()); err != nil {
-		return outcome, err
+		return outcome, true, err
 	}
 	outcome.Incident = incident
 	if s.Audit != nil {
@@ -576,63 +974,96 @@ func (s *Service) coordinate(ctx context.Context, signal model.IncidentSignal, d
 			SideEffect: receipt.Outcome == model.ActionSucceeded, OccurredAt: s.Clock.Now(),
 		})
 	}
+	if receipt.Outcome == model.ActionSucceeded {
+		pending := pendingVerification{
+			Incident: incident, Diagnosis: dispatch.Diagnosis, Grant: dispatch.Grant, Receipt: receipt,
+			Target: dispatch.Target, StartedAt: s.Clock.Now().UTC(),
+			CorrelationID: dispatch.Envelope.CorrelationID, CausationID: receiptEnvelope.MessageID,
+		}
+		if err := s.replaceDispatchWithPending(ctx, key, pending); err != nil {
+			return outcome, true, fmt.Errorf("checkpoint action receipt before verification: %w", err)
+		}
+		verified, _ := s.verifyPending(ctx, key, s.Clock.Now().UTC())
+		return verified, true, nil
+	}
 	if receipt.Outcome == model.ActionDryRun {
 		if err := incident.Transition(model.IncidentEscalated, s.Clock.Now()); err != nil {
-			return outcome, err
+			return outcome, true, err
 		}
 		outcome.Incident = incident
 		outcome.Detail = "dry-run completed; no recovery state was inferred"
-		s.attachIncidentReport(ctx, &outcome, target, grantEnvelope.CorrelationID, receiptEnvelope.MessageID, model.ReportReasonDryRunCompleted)
-	} else if receipt.Outcome == model.ActionSucceeded {
-		var postcondition toolapi.GetWorkloadSnapshotOutput
-		observationErr := s.Tools.Call(ctx, toolapi.ToolGetWorkloadSnapshot, toolapi.GetWorkloadSnapshotInput{
-			Namespace: namespace, Kind: "Deployment", Name: deployment,
-		}, &postcondition)
-		if observationErr == nil && !postcondition.Snapshot.Target.Equal(target) {
-			observationErr = model.NewError(model.CodeExecutionFailed, "post-action snapshot target differs from the delegated target")
-		}
-		if observationErr != nil {
-			outcome.Status = "verification_pending"
-			outcome.Detail = "action succeeded but post-action observation failed: " + observationErr.Error()
-		} else if workloadAvailable(postcondition.Snapshot) {
-			if err := incident.Transition(model.IncidentResolved, s.Clock.Now()); err != nil {
-				return outcome, err
-			}
-			outcome.Incident = incident
-			outcome.Status = "resolved"
-			outcome.Detail = "fresh post-action observation meets availability criteria"
-			s.attachIncidentReport(ctx, &outcome, target, grantEnvelope.CorrelationID, receiptEnvelope.MessageID, model.ReportReasonRecoveryVerified)
-		} else {
-			outcome.Status = "verification_pending"
-			outcome.Detail = "action succeeded; fresh observation has not yet met availability criteria"
-		}
-		if outcome.Status == "verification_pending" {
-			s.storePending(signal.Fingerprint, pendingVerification{
-				Incident: incident, Diagnosis: diagnosis, Grant: grant, Receipt: receipt,
-				Target: target, StartedAt: s.Clock.Now().UTC(),
-				CorrelationID: grantEnvelope.CorrelationID, CausationID: receiptEnvelope.MessageID,
-			})
-			outcome.Incident = incident
-		}
-	} else if receipt.Outcome == model.ActionEscalated {
+		s.attachIncidentReport(ctx, &outcome, dispatch.Target, dispatch.Envelope.CorrelationID, receiptEnvelope.MessageID, model.ReportReasonDryRunCompleted)
+		return outcome, true, nil
+	}
+	if receipt.Outcome == model.ActionEscalated {
 		if err := incident.Transition(model.IncidentEscalated, s.Clock.Now()); err != nil {
-			return outcome, err
+			return outcome, true, err
 		}
 		outcome.Incident = incident
 		outcome.Detail = "Operator reported that the action requires authority outside the delegation"
-		s.attachIncidentReport(ctx, &outcome, target, grantEnvelope.CorrelationID, receiptEnvelope.MessageID, model.ReportReasonAuthorityExceeded)
-	} else {
-		if err := incident.Transition(model.IncidentFailed, s.Clock.Now()); err != nil {
-			return outcome, err
-		}
-		outcome.Incident = incident
-		reason := model.ReportReasonActionFailed
-		if receipt.Outcome == model.ActionRejected {
-			reason = model.ReportReasonActionRejected
-		}
-		s.attachIncidentReport(ctx, &outcome, target, grantEnvelope.CorrelationID, receiptEnvelope.MessageID, reason)
+		s.attachIncidentReport(ctx, &outcome, dispatch.Target, dispatch.Envelope.CorrelationID, receiptEnvelope.MessageID, model.ReportReasonAuthorityExceeded)
+		return outcome, true, nil
 	}
-	return outcome, nil
+	if err := incident.Transition(model.IncidentFailed, s.Clock.Now()); err != nil {
+		return outcome, true, err
+	}
+	outcome.Incident = incident
+	reason := model.ReportReasonActionFailed
+	if receipt.Outcome == model.ActionRejected {
+		reason = model.ReportReasonActionRejected
+	}
+	s.attachIncidentReport(ctx, &outcome, dispatch.Target, dispatch.Envelope.CorrelationID, receiptEnvelope.MessageID, reason)
+	return outcome, true, nil
+}
+
+func (s *Service) storeDispatch(ctx context.Context, key string, dispatch pendingDispatch) error {
+	s.mu.Lock()
+	if s.tracker == nil {
+		s.tracker = make(map[string]*observation)
+	}
+	item := s.tracker[key]
+	if item == nil {
+		item = &observation{WorkloadKey: key}
+		s.tracker[key] = item
+	}
+	item.Dispatch = &dispatch
+	item.Pending = nil
+	item.Report = nil
+	s.mu.Unlock()
+	return s.persistCheckpoint(ctx)
+}
+
+func (s *Service) replaceDispatchWithPending(ctx context.Context, key string, pending pendingVerification) error {
+	s.mu.Lock()
+	item := s.tracker[key]
+	if item == nil || item.Dispatch == nil || item.Dispatch.Grant.GrantID != pending.Grant.GrantID {
+		s.mu.Unlock()
+		return model.NewError(model.CodeExecutionFailed, "durable remediation dispatch changed before receipt checkpoint")
+	}
+	item.Dispatch = nil
+	item.Pending = &pending
+	s.mu.Unlock()
+	return s.persistCheckpoint(ctx)
+}
+
+func (s *Service) workflowKeys() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keys := make([]string, 0)
+	for key, item := range s.tracker {
+		if item != nil && (item.Dispatch != nil || item.Report != nil) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func (s *Service) hasWorkflow(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item := s.tracker[key]
+	return item != nil && (item.Pending != nil || item.Dispatch != nil || item.Report != nil)
 }
 
 func (s *Service) attachIncidentReport(
@@ -645,35 +1076,44 @@ func (s *Service) attachIncidentReport(
 	if outcome == nil || outcome.Diagnosis == nil || !outcome.Incident.State.Terminal() {
 		return
 	}
+	key := workloadFingerprint(target.Namespace, target.Name)
 	if s.ReportSigner == nil {
 		appendOutcomeDetail(outcome, "incident report request was not sent: Monitor report signing key is unavailable")
+		_ = s.completeWorkflow(ctx, key)
 		return
 	}
 	requestedAt := s.Clock.Now().UTC()
 	request := model.IncidentReportRequest{
-		SchemaVersion: model.SchemaVersionV1,
+		SchemaVersion: model.IncidentReportRequestSchemaVersionV2,
 		RequestID:     "report-request-" + outcome.Incident.ID + "-" + string(reason),
 		Issuer:        model.AgentMonitor, Audience: model.AgentOperator,
 		IncidentID: outcome.Incident.ID, CorrelationID: correlationID,
 		DiagnosisReportID: outcome.Diagnosis.ID, Target: target,
 		FinalState: outcome.Incident.State, Reason: reason,
-		RequestedAt: requestedAt, ExpiresAt: requestedAt.Add(s.delegationTTL()),
+		ReportCreatedAt: requestedAt, RequestedAt: requestedAt,
+		ExpiresAt: requestedAt.Add(model.MaxIncidentReportRequestTTL),
 	}
 	if outcome.Grant != nil && outcome.Receipt != nil {
 		request.GrantID = outcome.Grant.GrantID
 		request.ReceiptID = outcome.Receipt.ReceiptID
+	} else if outcome.Grant != nil &&
+		(reason == model.ReportReasonActionOutcomeUnverified || reason == model.ReportReasonAuthorityExceeded) {
+		request.GrantID = outcome.Grant.GrantID
 	}
 	if err := s.ReportSigner.SignReportRequest(&request); err != nil {
 		appendOutcomeDetail(outcome, "incident report request could not be signed: "+err.Error())
+		_ = s.completeWorkflow(ctx, key)
 		return
 	}
 	if err := request.ValidateSigned(); err != nil {
 		appendOutcomeDetail(outcome, "incident report request was invalid: "+err.Error())
+		_ = s.completeWorkflow(ctx, key)
 		return
 	}
 	expectedReportID, err := request.DeterministicReportID()
 	if err != nil {
 		appendOutcomeDetail(outcome, "incident report identity could not be derived: "+err.Error())
+		_ = s.completeWorkflow(ctx, key)
 		return
 	}
 	envelope, err := model.NewEnvelope(
@@ -683,42 +1123,173 @@ func (s *Service) attachIncidentReport(
 	)
 	if err != nil {
 		appendOutcomeDetail(outcome, "incident report request could not be created: "+err.Error())
+		_ = s.completeWorkflow(ctx, key)
 		return
 	}
-	var response model.Envelope
-	if err := s.Peers.Send(ctx, s.OperatorURL, envelope, &response); err != nil {
-		appendOutcomeDetail(outcome, "incident report delivery request failed: "+err.Error())
-		return
+	checkpoint := pendingReport{
+		Outcome: *outcome, Target: target, Request: request,
+		Envelope: envelope, ExpectedReportID: expectedReportID,
 	}
-	if err := validateResponse(
-		response, outcome.Incident.ID, correlationID, envelope.MessageID,
-		model.AgentOperator, model.AgentMonitor, model.MessageIncidentReport,
-	); err != nil {
-		appendOutcomeDetail(outcome, "incident report response was rejected: "+err.Error())
-		return
-	}
-	var result model.IncidentReportResult
-	if err := response.DecodePayload(&result); err != nil {
-		appendOutcomeDetail(outcome, "incident report response could not be decoded: "+err.Error())
-		return
-	}
-	if err := result.Validate(); err != nil ||
-		result.Report.ReportID != expectedReportID ||
-		result.Report.RequestID != request.RequestID ||
-		result.Report.IncidentID != request.IncidentID ||
-		result.Report.CorrelationID != request.CorrelationID ||
-		result.Report.DiagnosisReportID != request.DiagnosisReportID ||
-		!result.Report.Target.Equal(request.Target) ||
-		result.Report.FinalState != request.FinalState || result.Report.Reason != request.Reason ||
-		!result.Report.CreatedAt.Equal(request.RequestedAt) ||
-		!reportExecutionMatchesRequest(result.Report.Execution, request, outcome.Receipt) {
-		if err == nil {
-			err = model.NewError(model.CodeInvalidInput, "incident report result differs from the Monitor request")
+	if s.StateStore != nil {
+		if err := s.storeReport(ctx, key, checkpoint); err != nil {
+			appendOutcomeDetail(outcome, "incident report request could not be checkpointed: "+err.Error())
+			return
 		}
-		appendOutcomeDetail(outcome, "incident report response was rejected: "+err.Error())
+	}
+	result, err := s.deliverReport(ctx, checkpoint)
+	if err != nil {
+		appendOutcomeDetail(outcome, err.Error())
 		return
 	}
 	outcome.Report = &result
+	if err := s.completeWorkflow(ctx, key); err != nil {
+		appendOutcomeDetail(outcome, "incident report acknowledgement could not be checkpointed: "+err.Error())
+	}
+}
+
+func (s *Service) deliverReport(ctx context.Context, checkpoint pendingReport) (model.IncidentReportResult, error) {
+	var response model.Envelope
+	if err := s.Peers.Send(ctx, s.OperatorURL, checkpoint.Envelope, &response); err != nil {
+		return model.IncidentReportResult{}, fmt.Errorf("incident report delivery request failed: %w", err)
+	}
+	if err := validateResponse(
+		response, checkpoint.Outcome.Incident.ID, checkpoint.Request.CorrelationID, checkpoint.Envelope.MessageID,
+		model.AgentOperator, model.AgentMonitor, model.MessageIncidentReport,
+	); err != nil {
+		return model.IncidentReportResult{}, fmt.Errorf("incident report response was rejected: %w", err)
+	}
+	var result model.IncidentReportResult
+	if err := response.DecodePayload(&result); err != nil {
+		return model.IncidentReportResult{}, fmt.Errorf("incident report response could not be decoded: %w", err)
+	}
+	if err := result.Validate(); err != nil ||
+		result.Report.ReportID != checkpoint.ExpectedReportID ||
+		result.Report.RequestID != checkpoint.Request.RequestID ||
+		result.Report.IncidentID != checkpoint.Request.IncidentID ||
+		result.Report.CorrelationID != checkpoint.Request.CorrelationID ||
+		result.Report.DiagnosisReportID != checkpoint.Request.DiagnosisReportID ||
+		!result.Report.Target.Equal(checkpoint.Request.Target) ||
+		result.Report.FinalState != checkpoint.Request.FinalState || result.Report.Reason != checkpoint.Request.Reason ||
+		!result.Report.CreatedAt.Equal(checkpoint.Request.ReportCreatedAt) ||
+		!reportExecutionMatchesRequest(result.Report.Execution, checkpoint.Request, checkpoint.Outcome.Receipt) {
+		if err == nil {
+			err = model.NewError(model.CodeInvalidInput, "incident report result differs from the Monitor request")
+		}
+		return model.IncidentReportResult{}, fmt.Errorf("incident report response was rejected: %w", err)
+	}
+	return result, nil
+}
+
+func (s *Service) resumeReport(ctx context.Context, key string) (IncidentOutcome, bool, error) {
+	s.mu.Lock()
+	item := s.tracker[key]
+	if item == nil || item.Report == nil {
+		s.mu.Unlock()
+		return IncidentOutcome{}, false, nil
+	}
+	checkpoint := *item.Report
+	s.mu.Unlock()
+	outcome := checkpoint.Outcome
+	result, err := s.deliverReport(ctx, checkpoint)
+	code, coded := model.ErrorCodeOf(err)
+	locallyExpired := !s.Clock.Now().UTC().Before(checkpoint.Request.ExpiresAt.UTC())
+	if coded && (code == model.CodeGrantExpired || (code == model.CodeInvalidSignature && locallyExpired)) {
+		refreshed, refreshErr := s.refreshExpiredReport(ctx, key, checkpoint)
+		if refreshErr != nil {
+			outcome.Status = "report_delivery_expired"
+			appendOutcomeDetail(&outcome, refreshErr.Error())
+			return outcome, true, nil
+		}
+		checkpoint = refreshed
+		outcome = checkpoint.Outcome
+		result, err = s.deliverReport(ctx, checkpoint)
+	}
+	if err != nil {
+		outcome.Status = "report_delivery_pending"
+		appendOutcomeDetail(&outcome, err.Error())
+		return outcome, true, nil
+	}
+	outcome.Report = &result
+	if err := s.completeWorkflow(ctx, key); err != nil {
+		appendOutcomeDetail(&outcome, "incident report acknowledgement could not be checkpointed: "+err.Error())
+		return outcome, true, err
+	}
+	return outcome, true, nil
+}
+
+func (s *Service) refreshExpiredReport(ctx context.Context, key string, checkpoint pendingReport) (pendingReport, error) {
+	if s.ReportSigner == nil {
+		return pendingReport{}, errors.New("incident report request cannot be renewed: Monitor report signing key is unavailable")
+	}
+	requestedAt := s.Clock.Now().UTC()
+	request := checkpoint.Request
+	request.RequestedAt = requestedAt
+	request.ExpiresAt = requestedAt.Add(model.MaxIncidentReportRequestTTL)
+	request.Signature = model.ReportRequestSignature{}
+	if err := s.ReportSigner.SignReportRequest(&request); err != nil {
+		return pendingReport{}, fmt.Errorf("renew expired incident report request signature: %w", err)
+	}
+	if err := request.ValidateSigned(); err != nil {
+		return pendingReport{}, fmt.Errorf("renewed incident report request is invalid: %w", err)
+	}
+	expectedReportID, err := request.DeterministicReportID()
+	if err != nil {
+		return pendingReport{}, fmt.Errorf("derive renewed incident report identity: %w", err)
+	}
+	envelope, err := model.NewEnvelope(
+		s.IDs.NewID(), checkpoint.Outcome.Incident.ID, request.CorrelationID, checkpoint.Envelope.MessageID,
+		model.AgentMonitor, model.AgentOperator, model.MessageIncidentReportRequest,
+		requestedAt, request,
+	)
+	if err != nil {
+		return pendingReport{}, fmt.Errorf("create renewed incident report request: %w", err)
+	}
+	checkpoint.Request = request
+	checkpoint.Envelope = envelope
+	checkpoint.ExpectedReportID = expectedReportID
+	if err := s.storeReport(ctx, key, checkpoint); err != nil {
+		return pendingReport{}, fmt.Errorf("checkpoint renewed incident report request: %w", err)
+	}
+	return checkpoint, nil
+}
+
+func (s *Service) storeReport(ctx context.Context, key string, report pendingReport) error {
+	s.mu.Lock()
+	if s.tracker == nil {
+		s.tracker = make(map[string]*observation)
+	}
+	item := s.tracker[key]
+	if item == nil {
+		item = &observation{WorkloadKey: key}
+		s.tracker[key] = item
+	}
+	item.Dispatch = nil
+	item.Pending = nil
+	item.Report = &report
+	s.mu.Unlock()
+	return s.persistCheckpoint(ctx)
+}
+
+func (s *Service) completeWorkflow(ctx context.Context, key string) error {
+	s.mu.Lock()
+	item := s.tracker[key]
+	if item == nil {
+		item = &observation{WorkloadKey: key}
+		s.tracker[key] = item
+	}
+	item.Dispatch = nil
+	item.Pending = nil
+	item.Report = nil
+	item.Dispatched = s.Clock.Now().UTC()
+	item.LastSeen = item.Dispatched
+	item.Consecutive = 0
+	for _, candidate := range s.tracker {
+		if candidate != nil && candidate.WorkloadKey == key {
+			candidate.Consecutive = 0
+		}
+	}
+	s.mu.Unlock()
+	return s.persistCheckpoint(ctx)
 }
 
 func reportExecutionMatchesRequest(
@@ -779,9 +1350,9 @@ func validateReceiptForGrant(receipt model.ActionReceipt, grant model.Delegation
 	if receipt.GrantID != grant.GrantID || receipt.IncidentID != grant.IncidentID || !receipt.Action.Equal(grant.Action) {
 		return model.NewError(model.CodeExecutionFailed, "Operator receipt does not match the delegated grant")
 	}
-	if receipt.DryRun != grant.DryRun ||
+	if receipt.Outcome != model.ActionRejected && (receipt.DryRun != grant.DryRun ||
 		(grant.DryRun && receipt.Outcome != model.ActionDryRun) ||
-		(!grant.DryRun && receipt.Outcome == model.ActionDryRun) {
+		(!grant.DryRun && receipt.Outcome == model.ActionDryRun)) {
 		return model.NewError(model.CodeExecutionFailed, "Operator receipt dry-run semantics do not match the delegated grant")
 	}
 	return nil
@@ -810,11 +1381,13 @@ func (s *Service) verifyPending(ctx context.Context, key string, now time.Time) 
 			outcome.Detail = transitionErr.Error()
 			return outcome, true
 		}
-		s.clearPending(key, pending.Grant.GrantID, now)
 		outcome.Incident = pending.Incident
 		outcome.Status = "resolved"
 		outcome.Detail = "follow-up observation meets availability criteria"
 		s.attachIncidentReport(ctx, &outcome, pending.Target, pending.CorrelationID, pending.CausationID, model.ReportReasonRecoveryVerified)
+		if s.StateStore == nil {
+			s.clearPending(key, pending.Grant.GrantID, now)
+		}
 		return outcome, true
 	}
 	if !now.Before(pending.StartedAt) && now.Sub(pending.StartedAt) >= s.cooldown() {
@@ -823,7 +1396,6 @@ func (s *Service) verifyPending(ctx context.Context, key string, now time.Time) 
 			outcome.Detail = transitionErr.Error()
 			return outcome, true
 		}
-		s.clearPending(key, pending.Grant.GrantID, now)
 		outcome.Incident = pending.Incident
 		outcome.Status = "escalated"
 		outcome.Detail = "post-action verification window elapsed without recovery"
@@ -831,6 +1403,9 @@ func (s *Service) verifyPending(ctx context.Context, key string, now time.Time) 
 			outcome.Detail += ": " + err.Error()
 		}
 		s.attachIncidentReport(ctx, &outcome, pending.Target, pending.CorrelationID, pending.CausationID, model.ReportReasonVerificationTimedOut)
+		if s.StateStore == nil {
+			s.clearPending(key, pending.Grant.GrantID, now)
+		}
 		return outcome, true
 	}
 	if err != nil {
@@ -900,7 +1475,8 @@ func (s *Service) confirm(key, workloadKey string, now time.Time) bool {
 		s.tracker = make(map[string]*observation)
 	}
 	if workload := s.tracker[workloadKey]; workload != nil {
-		if workload.Pending != nil || (!workload.Dispatched.IsZero() && now.Sub(workload.Dispatched) < s.cooldown()) {
+		if workload.Pending != nil || workload.Dispatch != nil || workload.Report != nil ||
+			(!workload.Dispatched.IsZero() && now.Sub(workload.Dispatched) < s.cooldown()) {
 			return false
 		}
 	}
@@ -951,7 +1527,7 @@ func (s *Service) resetConfirmations(now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, item := range s.tracker {
-		if item.Pending == nil {
+		if item.Pending == nil && item.Dispatch == nil && item.Report == nil {
 			item.Consecutive = 0
 			item.LastSeen = now
 		}
@@ -962,7 +1538,7 @@ func (s *Service) resetMissing(seen map[string]struct{}, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for key, item := range s.tracker {
-		if item.Pending != nil {
+		if item.Pending != nil || item.Dispatch != nil || item.Report != nil {
 			continue
 		}
 		if _, ok := seen[key]; !ok {

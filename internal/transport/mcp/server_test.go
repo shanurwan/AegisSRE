@@ -2,10 +2,12 @@ package mcptransport
 
 import (
 	"context"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/shanurwan/AegisSRE/internal/core/model"
 	"github.com/shanurwan/AegisSRE/internal/toolapi"
 )
 
@@ -13,6 +15,12 @@ type observeStub struct{}
 
 func (observeStub) QueryMetrics(_ context.Context, input toolapi.QueryMetricsInput) (toolapi.QueryMetricsOutput, error) {
 	return toolapi.QueryMetricsOutput{TemplateID: input.TemplateID}, nil
+}
+
+type failingObserveStub struct{ observeStub }
+
+func (failingObserveStub) QueryMetrics(context.Context, toolapi.QueryMetricsInput) (toolapi.QueryMetricsOutput, error) {
+	return toolapi.QueryMetricsOutput{}, model.NewError(model.CodeOutOfScope, "caller-selected workload is outside policy")
 }
 func (observeStub) QueryLogSignals(_ context.Context, input toolapi.QueryLogSignalsInput) (toolapi.QueryLogSignalsOutput, error) {
 	return toolapi.QueryLogSignalsOutput{TemplateID: input.TemplateID}, nil
@@ -114,5 +122,26 @@ func TestReadServerDispatchesDetectionTools(t *testing.T) {
 	}
 	if got := <-backend.traceInputs; got != traceInput {
 		t.Fatalf("trace detector input = %#v, want %#v", got, traceInput)
+	}
+}
+
+func TestClientPreservesStructuredToolErrorCode(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(HTTPHandler(NewReadServer(failingObserveStub{})))
+	t.Cleanup(server.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Connect(ctx, server.URL, "structured-error-test", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	err = client.Call(ctx, toolapi.ToolQueryMetrics, toolapi.QueryMetricsInput{
+		TemplateID: toolapi.MetricDeploymentUnavailable,
+		Namespace:  "outside-policy",
+	}, &toolapi.QueryMetricsOutput{})
+	if code, ok := model.ErrorCodeOf(err); !ok || code != model.CodeOutOfScope {
+		t.Fatalf("Call() error = %v, code = %q, want %q", err, code, model.CodeOutOfScope)
 	}
 }

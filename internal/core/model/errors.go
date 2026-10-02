@@ -21,6 +21,7 @@ const (
 	CodeGrantNotYetValid       ErrorCode = "GRANT_NOT_YET_VALID"
 	CodeGrantExpired           ErrorCode = "GRANT_EXPIRED"
 	CodeReplayedGrant          ErrorCode = "REPLAYED_GRANT"
+	CodeExecutionPending       ErrorCode = "EXECUTION_PENDING"
 	CodeStalePrecondition      ErrorCode = "STALE_PRECONDITION"
 	CodeToolBudgetExceeded     ErrorCode = "TOOL_BUDGET_EXCEEDED"
 	CodeInconclusiveDiagnosis  ErrorCode = "INCONCLUSIVE_DIAGNOSIS"

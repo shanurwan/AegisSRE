@@ -9,20 +9,45 @@ on:
 permissions:
   contents: read
   packages: write
+  id-token: write
+  attestations: write
 
 concurrency:
-  group: image-${{ github.ref }}
-  cancel-in-progress: true
+  # Registry promotion is a serialized transaction. Never cancel a run after
+  # it starts publishing or replace a queued release with a newer event.
+  group: image-release
+  cancel-in-progress: false
+  queue: max
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+        env:
+          POSTGRES_USER: aegis
+          POSTGRES_PASSWORD: aegis-test-only
+          POSTGRES_DB: aegis
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aegis -d aegis"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      AEGIS_TEST_DATABASE_URL: postgres://aegis:aegis-test-only@127.0.0.1:5432/aegis?sslmode=disable
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: "1.26.8"
           cache: true
@@ -33,12 +58,19 @@ jobs:
           test -z "$(gofmt -l .)"
           go vet ./...
           go test ./...
+          test "$(go test -list '^TestE2E' ./internal/integration | grep -c '^TestE2E')" -ge 5
+          go test -count=1 -timeout=30s -run '^TestE2E' ./internal/integration
+          go test -race -count=1 ./...
+          go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+          python -B -m unittest discover -s hack -p '*_test.py'
+          make manifest-policy-overlays
+          docker compose config --quiet
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Sign in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -46,23 +78,129 @@ jobs:
 
       - name: Compute image tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ghcr.io/shanurwan/aegissre
+          flavor: latest=false
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=sha-
+            type=raw,value=sha-${{ github.sha }},enable={{is_default_branch}}
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
 
-      - name: Build and publish
-        uses: docker/build-push-action@v6
+      - name: Validate immutable release tag set
+        shell: bash
+        env:
+          RELEASE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: test -n "$(printf '%s' "$RELEASE_TAGS" | tr -d '[:space:]')"
+
+      # Build exactly once. The SHA-scoped candidate is not a release channel;
+      # release tags are attached only after both platform manifests pass the
+      # vulnerability and deployment-policy gates below.
+      - name: Build and publish immutable scan candidate
+        id: candidate
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ghcr.io/shanurwan/aegissre:scan-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: GO_VERSION=1.26.8
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Scan exact amd64 candidate digest
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          image-ref: ghcr.io/shanurwan/aegissre@${{ steps.candidate.outputs.digest }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+
+      - name: Scan exact arm64 candidate digest
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          image-ref: ghcr.io/shanurwan/aegissre@${{ steps.candidate.outputs.digest }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+
+      - name: Validate the release render against the candidate digest
+        shell: bash
+        env:
+          CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
+        run: |
+          cp -R deploy "$RUNNER_TEMP/release-deploy"
+          sed -i \
+            "s#sha256:0000000000000000000000000000000000000000000000000000000000000000#${CANDIDATE_DIGEST}#g" \
+            "$RUNNER_TEMP/release-deploy/kubernetes/overlays/production/kustomization.yaml"
+          sed -i \
+            "s#aegis-postgres-migrate-replace-before-live#aegis-postgres-migrate-${GITHUB_SHA:0:12}#g" \
+            "$RUNNER_TEMP/release-deploy/kubernetes/overlays/production/postgres-migration.yaml"
+          python scripts/manifest-policy.py \
+            --overlay "$RUNNER_TEMP/release-deploy/kubernetes/overlays/laboratory/execute" \
+            --expected-target aegissre-e2e-canary \
+            --expected-dry-run false \
+            --expected-mutations true \
+            --expected-image "ghcr.io/shanurwan/aegissre@${CANDIDATE_DIGEST}" \
+            --expected-migration-name "aegis-postgres-migrate-${GITHUB_SHA:0:12}" \
+            --profile release
+
+      # Attest before exposing any release-channel tag. A failed attestation
+      # leaves only the SHA-scoped candidate and cannot create a partial release.
+      - name: Attest image provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ghcr.io/shanurwan/aegissre
+          subject-digest: ${{ steps.candidate.outputs.digest }}
+          push-to-registry: true
+
+      - name: Promote the exact scanned digest to release tags
+        shell: bash
+        env:
+          CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
+          RELEASE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          tag_args=()
+          while IFS= read -r tag; do
+            if [[ -n "$tag" ]]; then
+              tag_args+=(--tag "$tag")
+            fi
+          done <<< "$RELEASE_TAGS"
+          test "${#tag_args[@]}" -gt 0
+          inspect_error="$(mktemp)"
+          trap 'rm -f "$inspect_error"' EXIT
+          while IFS= read -r tag; do
+            if [[ -n "$tag" ]]; then
+              if existing_digest="$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest.Digest}}' 2>"$inspect_error" | tr -d '"')"; then
+                [[ "$existing_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+                if [[ "$existing_digest" != "$CANDIDATE_DIGEST" ]]; then
+                  echo "refusing to move immutable release tag $tag" >&2
+                  exit 1
+                fi
+              elif ! grep -Eiq 'manifest unknown|not found' "$inspect_error"; then
+                cat "$inspect_error" >&2
+                exit 1
+              fi
+              : >"$inspect_error"
+            fi
+          done <<< "$RELEASE_TAGS"
+          docker buildx imagetools create \
+            "${tag_args[@]}" \
+            "ghcr.io/shanurwan/aegissre@${CANDIDATE_DIGEST}"
+          while IFS= read -r tag; do
+            if [[ -n "$tag" ]]; then
+              promoted_digest="$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+              [[ "$promoted_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+              test "$promoted_digest" = "$CANDIDATE_DIGEST"
+            fi
+          done <<< "$RELEASE_TAGS"

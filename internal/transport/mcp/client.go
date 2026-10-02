@@ -7,11 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/shanurwan/AegisSRE/internal/core/model"
 	"github.com/shanurwan/AegisSRE/internal/platform/httpclient"
+	"github.com/shanurwan/AegisSRE/internal/platform/observability"
 )
 
 type Client struct {
@@ -19,7 +23,15 @@ type Client struct {
 }
 
 func Connect(ctx context.Context, endpoint, name string, timeout time.Duration) (*Client, error) {
-	httpClient := httpclient.Direct(timeout)
+	return ConnectWithHTTPClient(ctx, endpoint, name, timeout, nil)
+}
+
+// ConnectWithHTTPClient permits the process composition root to inject an
+// mTLS client bound to the exact destination workload identity.
+func ConnectWithHTTPClient(ctx context.Context, endpoint, name string, timeout time.Duration, httpClient *http.Client) (*Client, error) {
+	if httpClient == nil {
+		httpClient = observability.HTTPClient(httpclient.Direct(timeout))
+	}
 	transport := &mcp.StreamableClientTransport{
 		Endpoint:             endpoint,
 		HTTPClient:           httpClient,
@@ -69,14 +81,28 @@ func (c *Client) Call(ctx context.Context, name string, input, output any) error
 		return fmt.Errorf("call MCP tool %s: %w", name, err)
 	}
 	if result.IsError {
-		message := "application error"
+		failure := toolFailure{
+			SchemaVersion: toolErrorSchemaV1,
+			Code:          model.CodeExecutionFailed,
+			Message:       "constrained MCP tool failed",
+		}
 		for _, content := range result.Content {
 			if text, ok := content.(*mcp.TextContent); ok && text.Text != "" {
-				message = text.Text
+				var candidate toolFailure
+				decoder := json.NewDecoder(strings.NewReader(text.Text))
+				decoder.DisallowUnknownFields()
+				if err := decoder.Decode(&candidate); err == nil &&
+					candidate.SchemaVersion == toolErrorSchemaV1 &&
+					knownToolErrorCode(candidate.Code) && candidate.Message != "" {
+					var extra any
+					if err := decoder.Decode(&extra); err == io.EOF {
+						failure = candidate
+					}
+				}
 				break
 			}
 		}
-		return fmt.Errorf("MCP tool %s: %s", name, message)
+		return model.NewError(failure.Code, "MCP tool "+name+": "+failure.Message)
 	}
 	if result.StructuredContent == nil {
 		return fmt.Errorf("MCP tool %s omitted structured content", name)

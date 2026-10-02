@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-investigator
+spec:
+  template:
+    spec:
+      containers:
+        - name: investigator
+          env:
+            - name: AEGIS_PUBLIC_URL
+              value: https://aegis-investigator:8443
+            - name: AEGIS_TLS_CERT_FILE
+              value: /var/run/secrets/aegissre/tls/tls.crt
+            - name: AEGIS_TLS_KEY_FILE
+              value: /var/run/secrets/aegissre/tls/tls.key
+            - name: AEGIS_TLS_CA_FILE
+              value: /var/run/secrets/aegissre/trust/ca.crt
+            - name: AEGIS_TLS_IDENTITY
+              value: spiffe://aegissre.internal/ns/outage-arena/sa/aegis-investigator
+          volumeMounts:
+            - name: tls-leaf
+              mountPath: /var/run/secrets/aegissre/tls
+              readOnly: true
+            - name: tls-trust
+              mountPath: /var/run/secrets/aegissre/trust
+              readOnly: true
+      volumes:
+        - name: tls-leaf
+          secret:
+            secretName: aegis-investigator-tls
+            optional: false
+            defaultMode: 288
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+        - name: tls-trust
+          secret:
+            secretName: aegis-mtls-ca
+            optional: false
+            defaultMode: 288
+            items:
+              - key: ca.crt
+                path: ca.crt

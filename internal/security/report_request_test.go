@@ -101,9 +101,11 @@ func TestCanonicalIncidentReportRequestNormalizesTimesWithoutMutation(t *testing
 	now := time.Date(2026, 10, 2, 4, 0, 0, 0, time.UTC)
 	left := testReportRequest(now)
 	right := testReportRequest(now)
+	right.ReportCreatedAt = right.ReportCreatedAt.In(time.FixedZone("MYT", 8*60*60))
 	right.RequestedAt = right.RequestedAt.In(time.FixedZone("MYT", 8*60*60))
 	right.ExpiresAt = right.ExpiresAt.In(time.FixedZone("MYT", 8*60*60))
 	originalLocation := right.RequestedAt.Location()
+	originalReportLocation := right.ReportCreatedAt.Location()
 	leftBytes, err := CanonicalReportRequestBytes(left)
 	if err != nil {
 		t.Fatal(err)
@@ -115,14 +117,14 @@ func TestCanonicalIncidentReportRequestNormalizesTimesWithoutMutation(t *testing
 	if string(leftBytes) != string(rightBytes) {
 		t.Fatal("canonical report request changed across equivalent time zones")
 	}
-	if right.RequestedAt.Location() != originalLocation {
+	if right.RequestedAt.Location() != originalLocation || right.ReportCreatedAt.Location() != originalReportLocation {
 		t.Fatal("canonicalization mutated caller request")
 	}
 }
 
 func testReportRequest(now time.Time) model.IncidentReportRequest {
 	return model.IncidentReportRequest{
-		SchemaVersion:     model.SchemaVersionV1,
+		SchemaVersion:     model.IncidentReportRequestSchemaVersionV2,
 		RequestID:         "report-request-1",
 		Issuer:            model.AgentMonitor,
 		Audience:          model.AgentOperator,
@@ -133,9 +135,10 @@ func testReportRequest(now time.Time) model.IncidentReportRequest {
 			APIVersion: "apps/v1", Kind: "Deployment",
 			Namespace: "outage-arena", Name: "demo-api",
 		},
-		FinalState:  model.IncidentResolved,
-		Reason:      model.ReportReasonRecoveryVerified,
-		RequestedAt: now,
-		ExpiresAt:   now.Add(2 * time.Minute),
+		FinalState:      model.IncidentResolved,
+		Reason:          model.ReportReasonRecoveryVerified,
+		ReportCreatedAt: now,
+		RequestedAt:     now,
+		ExpiresAt:       now.Add(2 * time.Minute),
 	}
 }

@@ -473,7 +473,7 @@ func operatorReportRequest(t *testing.T, now time.Time, state model.IncidentStat
 
 func unsignedOperatorReportRequest(now time.Time, state model.IncidentState, reason model.IncidentReportReason) model.IncidentReportRequest {
 	return model.IncidentReportRequest{
-		SchemaVersion: model.SchemaVersionV1, RequestID: "report-request-1",
+		SchemaVersion: model.IncidentReportRequestSchemaVersionV2, RequestID: "report-request-1",
 		Issuer: model.AgentMonitor, Audience: model.AgentOperator,
 		IncidentID: "incident-1", CorrelationID: "correlation-1",
 		DiagnosisReportID: "diagnosis-1",
@@ -481,7 +481,7 @@ func unsignedOperatorReportRequest(now time.Time, state model.IncidentState, rea
 			APIVersion: "apps/v1", Kind: "Deployment",
 			Namespace: "outage-arena", Name: "demo-api",
 		},
-		FinalState: state, Reason: reason, RequestedAt: now,
+		FinalState: state, Reason: reason, ReportCreatedAt: now, RequestedAt: now,
 		ExpiresAt: now.Add(2 * time.Minute),
 	}
 }

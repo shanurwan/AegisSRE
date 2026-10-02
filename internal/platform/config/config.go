@@ -10,48 +10,71 @@ import (
 	"time"
 )
 
+// durableExecutionLeaseSafetyMargin covers the bounded post-cancellation
+// reconciliation/receipt-persistence window used by Operator and action MCP.
+// Their Aegis-owned request and persistence work must fit inside one lease;
+// external acceptance after cancellation remains an uncertain outcome.
+const durableExecutionLeaseSafetyMargin = 10 * time.Second
+
 type Config struct {
-	Role                 string
-	ListenAddr           string
-	PublicURL            string
-	AllowedNamespace     string
-	ObserveMCPURL        string
-	OperateMCPURL        string
-	InvestigatorURL      string
-	OperatorURL          string
-	VictoriaMetricsURL   string
-	VictoriaLogsURL      string
-	VictoriaTracesURL    string
-	Backend              string
-	FixturePath          string
-	Kubeconfig           string
-	ScanInterval         time.Duration
-	VerificationCount    int
-	IncidentCooldown     time.Duration
-	RequestTimeout       time.Duration
-	EvidenceBudget       int
-	MaxLogBytes          int
-	DryRun               bool
-	AllowMutations       bool
-	AllowLogTraceActions bool
-	DelegationTTL        time.Duration
-	MaxScaleReplicas     int
-	MaxScaleIncrease     int
-	DelegationPrivateKey string
-	DelegationPublicKey  string
-	DelegationKeyID      string
-	LLMBaseURL           string
-	LLMAPIKey            string
-	LLMModel             string
-	WhatsAppEnabled      bool
-	WhatsAppGraphVersion string
-	WhatsAppPhoneID      string
-	WhatsAppAccessToken  string
-	WhatsAppRecipient    string
-	WhatsAppTemplate     string
-	WhatsAppLanguage     string
-	WhatsAppMaxRetries   int
-	LogLevel             string
+	Role                     string
+	ListenAddr               string
+	AdminListenAddr          string
+	PublicURL                string
+	AllowedNamespace         string
+	ObserveMCPURL            string
+	OperateMCPURL            string
+	InvestigatorURL          string
+	OperatorURL              string
+	VictoriaMetricsURL       string
+	VictoriaLogsURL          string
+	VictoriaTracesURL        string
+	Backend                  string
+	FixturePath              string
+	Kubeconfig               string
+	ScanInterval             time.Duration
+	VerificationCount        int
+	IncidentCooldown         time.Duration
+	RequestTimeout           time.Duration
+	EvidenceBudget           int
+	MaxLogBytes              int
+	DryRun                   bool
+	AllowMutations           bool
+	AllowLogTraceActions     bool
+	DelegationTTL            time.Duration
+	MaxScaleReplicas         int
+	MaxScaleIncrease         int
+	DelegationPrivateKey     string
+	DelegationPrivateKeyFile string
+	DelegationPublicKey      string
+	DelegationKeyID          string
+	DelegationPublicKeysFile string
+	WorkloadPolicyPath       string
+	MTLSEnabled              bool
+	TLSCertificateFile       string
+	TLSPrivateKeyFile        string
+	TLSCAFile                string
+	TLSIdentity              string
+	TrustDomain              string
+	SystemNamespace          string
+	DatabaseURL              string
+	DatabaseURLFile          string
+	DatabaseMaxConnections   int
+	StateLease               time.Duration
+	OutboxPollInterval       time.Duration
+	OutboxMaxAttempts        int
+	InstanceID               string
+	LLMBaseURL               string
+	LLMAPIKey                string
+	LLMModel                 string
+	WhatsAppEnabled          bool
+	WhatsAppGraphVersion     string
+	WhatsAppPhoneID          string
+	WhatsAppAccessToken      string
+	WhatsAppRecipient        string
+	WhatsAppTemplate         string
+	WhatsAppLanguage         string
+	LogLevel                 string
 }
 
 func Load(role string) (Config, error) {
@@ -75,23 +98,39 @@ func Load(role string) (Config, error) {
 		}
 	}
 	cfg := Config{
-		Role:                 role,
-		ListenAddr:           env("AEGIS_LISTEN_ADDR", ":8080"),
-		PublicURL:            strings.TrimRight(env("AEGIS_PUBLIC_URL", "http://127.0.0.1:8080"), "/"),
-		AllowedNamespace:     env("AEGIS_ALLOWED_NAMESPACE", "outage-arena"),
-		ObserveMCPURL:        env("AEGIS_OBSERVE_MCP_URL", "http://127.0.0.1:8090/mcp"),
-		OperateMCPURL:        env("AEGIS_OPERATE_MCP_URL", "http://127.0.0.1:8091/mcp"),
-		InvestigatorURL:      strings.TrimRight(env("AEGIS_INVESTIGATOR_URL", "http://127.0.0.1:8081"), "/"),
-		OperatorURL:          strings.TrimRight(env("AEGIS_OPERATOR_URL", "http://127.0.0.1:8082"), "/"),
-		VictoriaMetricsURL:   strings.TrimRight(env("AEGIS_VICTORIA_METRICS_URL", "http://vmsingle.observability.svc.cluster.local:8428"), "/"),
-		VictoriaLogsURL:      strings.TrimRight(env("AEGIS_VICTORIA_LOGS_URL", "http://vlogs.observability.svc.cluster.local:9428"), "/"),
-		VictoriaTracesURL:    strings.TrimRight(env("AEGIS_VICTORIA_TRACES_URL", "http://vtraces.observability.svc.cluster.local:10428"), "/"),
-		Backend:              env("AEGIS_BACKEND", "kubernetes"),
-		FixturePath:          os.Getenv("AEGIS_FIXTURE_PATH"),
-		Kubeconfig:           os.Getenv("KUBECONFIG"),
-		DelegationPrivateKey: os.Getenv("AEGIS_DELEGATION_PRIVATE_KEY"),
-		DelegationPublicKey:  os.Getenv("AEGIS_DELEGATION_PUBLIC_KEY"),
-		DelegationKeyID:      env("AEGIS_DELEGATION_KEY_ID", "aegissre-monitor-v1"),
+		Role:                     role,
+		ListenAddr:               env("AEGIS_LISTEN_ADDR", ":8080"),
+		AdminListenAddr:          env("AEGIS_ADMIN_LISTEN_ADDR", ":9090"),
+		PublicURL:                strings.TrimRight(env("AEGIS_PUBLIC_URL", "http://127.0.0.1:8080"), "/"),
+		AllowedNamespace:         env("AEGIS_ALLOWED_NAMESPACE", "outage-arena"),
+		ObserveMCPURL:            env("AEGIS_OBSERVE_MCP_URL", "http://127.0.0.1:8090/mcp"),
+		OperateMCPURL:            env("AEGIS_OPERATE_MCP_URL", "http://127.0.0.1:8091/mcp"),
+		InvestigatorURL:          strings.TrimRight(env("AEGIS_INVESTIGATOR_URL", "http://127.0.0.1:8081"), "/"),
+		OperatorURL:              strings.TrimRight(env("AEGIS_OPERATOR_URL", "http://127.0.0.1:8082"), "/"),
+		VictoriaMetricsURL:       strings.TrimRight(env("AEGIS_VICTORIA_METRICS_URL", "http://vmsingle.observability.svc.cluster.local:8428"), "/"),
+		VictoriaLogsURL:          strings.TrimRight(env("AEGIS_VICTORIA_LOGS_URL", "http://vlogs.observability.svc.cluster.local:9428"), "/"),
+		VictoriaTracesURL:        strings.TrimRight(env("AEGIS_VICTORIA_TRACES_URL", "http://vtraces.observability.svc.cluster.local:10428"), "/"),
+		Backend:                  env("AEGIS_BACKEND", "kubernetes"),
+		FixturePath:              os.Getenv("AEGIS_FIXTURE_PATH"),
+		Kubeconfig:               os.Getenv("KUBECONFIG"),
+		DelegationPrivateKey:     os.Getenv("AEGIS_DELEGATION_PRIVATE_KEY"),
+		DelegationPrivateKeyFile: strings.TrimSpace(os.Getenv("AEGIS_DELEGATION_PRIVATE_KEY_FILE")),
+		DelegationPublicKey:      os.Getenv("AEGIS_DELEGATION_PUBLIC_KEY"),
+		DelegationKeyID:          env("AEGIS_DELEGATION_KEY_ID", "aegissre-monitor-v1"),
+		DelegationPublicKeysFile: firstNonEmpty(
+			strings.TrimSpace(os.Getenv("AEGIS_DELEGATION_PUBLIC_KEYRING_FILE")),
+			strings.TrimSpace(os.Getenv("AEGIS_DELEGATION_PUBLIC_KEYS_FILE")),
+		),
+		WorkloadPolicyPath:   strings.TrimSpace(os.Getenv("AEGIS_WORKLOAD_POLICY_FILE")),
+		TLSCertificateFile:   strings.TrimSpace(os.Getenv("AEGIS_TLS_CERT_FILE")),
+		TLSPrivateKeyFile:    strings.TrimSpace(os.Getenv("AEGIS_TLS_KEY_FILE")),
+		TLSCAFile:            strings.TrimSpace(os.Getenv("AEGIS_TLS_CA_FILE")),
+		TLSIdentity:          strings.TrimSpace(os.Getenv("AEGIS_TLS_IDENTITY")),
+		TrustDomain:          env("AEGIS_TRUST_DOMAIN", "aegissre.internal"),
+		SystemNamespace:      env("AEGIS_SYSTEM_NAMESPACE", "aegissre-system"),
+		DatabaseURL:          strings.TrimSpace(os.Getenv("AEGIS_DATABASE_URL")),
+		DatabaseURLFile:      strings.TrimSpace(os.Getenv("AEGIS_DATABASE_URL_FILE")),
+		InstanceID:           strings.TrimSpace(os.Getenv("AEGIS_INSTANCE_ID")),
 		LLMBaseURL:           strings.TrimRight(os.Getenv("AEGIS_LLM_BASE_URL"), "/"),
 		LLMAPIKey:            os.Getenv("AEGIS_LLM_API_KEY"),
 		LLMModel:             strings.TrimSpace(os.Getenv("AEGIS_LLM_MODEL")),
@@ -131,6 +170,9 @@ func Load(role string) (Config, error) {
 	if cfg.AllowLogTraceActions, err = boolean("AEGIS_ALLOW_LOG_TRACE_ACTIONS", false); err != nil {
 		return Config{}, err
 	}
+	if cfg.MTLSEnabled, err = boolean("AEGIS_MTLS_ENABLED", false); err != nil {
+		return Config{}, err
+	}
 	if cfg.DelegationTTL, err = duration("AEGIS_DELEGATION_TTL", 2*time.Minute); err != nil {
 		return Config{}, err
 	}
@@ -143,7 +185,16 @@ func Load(role string) (Config, error) {
 	if cfg.WhatsAppEnabled, err = boolean("AEGIS_WHATSAPP_ENABLED", false); err != nil {
 		return Config{}, err
 	}
-	if cfg.WhatsAppMaxRetries, err = integer("AEGIS_WHATSAPP_MAX_RETRIES", 2); err != nil {
+	if cfg.DatabaseMaxConnections, err = integer("AEGIS_DATABASE_MAX_CONNECTIONS", 8); err != nil {
+		return Config{}, err
+	}
+	if cfg.StateLease, err = duration("AEGIS_STATE_LEASE", time.Minute); err != nil {
+		return Config{}, err
+	}
+	if cfg.OutboxPollInterval, err = duration("AEGIS_OUTBOX_POLL_INTERVAL", 2*time.Second); err != nil {
+		return Config{}, err
+	}
+	if cfg.OutboxMaxAttempts, err = integer("AEGIS_OUTBOX_MAX_ATTEMPTS", 8); err != nil {
 		return Config{}, err
 	}
 	if err := cfg.Validate(); err != nil {
@@ -153,8 +204,11 @@ func Load(role string) (Config, error) {
 }
 
 func (c Config) Validate() error {
-	if c.ListenAddr == "" || c.PublicURL == "" || c.AllowedNamespace == "" {
+	if c.ListenAddr == "" || c.AdminListenAddr == "" || c.PublicURL == "" || c.AllowedNamespace == "" {
 		return errors.New("listen address, public URL, and allowed namespace are required")
+	}
+	if c.MTLSEnabled && c.ListenAddr == c.AdminListenAddr {
+		return errors.New("AEGIS_ADMIN_LISTEN_ADDR must differ from AEGIS_LISTEN_ADDR when mTLS is enabled")
 	}
 	if c.ScanInterval <= 0 || c.ScanInterval > 24*time.Hour || c.VerificationCount < 1 || c.VerificationCount > 10 {
 		return errors.New("scan interval must be positive and verification count must be 1..10")
@@ -177,13 +231,104 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.DelegationKeyID) == "" {
 		return errors.New("delegation key ID is required")
 	}
+	if c.DelegationPrivateKey != "" && c.DelegationPrivateKeyFile != "" {
+		return errors.New("configure only one of AEGIS_DELEGATION_PRIVATE_KEY or AEGIS_DELEGATION_PRIVATE_KEY_FILE")
+	}
+	if c.DelegationPublicKey != "" && c.DelegationPublicKeysFile != "" {
+		return errors.New("configure only one of AEGIS_DELEGATION_PUBLIC_KEY or AEGIS_DELEGATION_PUBLIC_KEYRING_FILE")
+	}
+	if c.DatabaseURL != "" && c.DatabaseURLFile != "" {
+		return errors.New("configure only one of AEGIS_DATABASE_URL or AEGIS_DATABASE_URL_FILE")
+	}
+	if c.InstanceID != "" && (strings.TrimSpace(c.InstanceID) != c.InstanceID || len(c.InstanceID) > 512) {
+		return errors.New("AEGIS_INSTANCE_ID must be non-blank and no more than 512 bytes")
+	}
+	if c.DatabaseMaxConnections < 1 || c.DatabaseMaxConnections > 50 {
+		return errors.New("AEGIS_DATABASE_MAX_CONNECTIONS must be between one and fifty")
+	}
+	if c.StateLease < 5*time.Second || c.StateLease > 5*time.Minute {
+		return errors.New("AEGIS_STATE_LEASE must be between five seconds and five minutes")
+	}
+	if c.Role == "monitor" && (c.DatabaseURL != "" || c.DatabaseURLFile != "") && c.StateLease <= c.ScanInterval {
+		return errors.New("AEGIS_STATE_LEASE must exceed AEGIS_SCAN_INTERVAL for durable Monitor leadership")
+	}
+	if (c.Role == "operator" || c.Role == "mcp-action") &&
+		(c.DatabaseURL != "" || c.DatabaseURLFile != "") &&
+		c.StateLease <= c.RequestTimeout+durableExecutionLeaseSafetyMargin {
+		return errors.New("AEGIS_STATE_LEASE must exceed AEGIS_REQUEST_TIMEOUT by more than ten seconds for durable execution fencing")
+	}
+	if c.OutboxPollInterval < 100*time.Millisecond || c.OutboxPollInterval > time.Minute {
+		return errors.New("AEGIS_OUTBOX_POLL_INTERVAL must be between 100ms and one minute")
+	}
+	if c.OutboxMaxAttempts < 1 || c.OutboxMaxAttempts > 100 {
+		return errors.New("AEGIS_OUTBOX_MAX_ATTEMPTS must be between one and one hundred")
+	}
+	if !validDNSName(c.TrustDomain, true) || !validDNSName(c.SystemNamespace, false) {
+		return errors.New("AEGIS_TRUST_DOMAIN or AEGIS_SYSTEM_NAMESPACE is invalid")
+	}
+	if c.MTLSEnabled {
+		for name, value := range map[string]string{
+			"AEGIS_TLS_CERT_FILE": c.TLSCertificateFile,
+			"AEGIS_TLS_KEY_FILE":  c.TLSPrivateKeyFile,
+			"AEGIS_TLS_CA_FILE":   c.TLSCAFile,
+			"AEGIS_TLS_IDENTITY":  c.TLSIdentity,
+		} {
+			if strings.TrimSpace(value) == "" {
+				return fmt.Errorf("%s is required when AEGIS_MTLS_ENABLED=true", name)
+			}
+		}
+		expected, err := workloadIdentity(c.TrustDomain, c.SystemNamespace, c.Role)
+		if err != nil {
+			return err
+		}
+		if c.TLSIdentity != expected {
+			return errors.New("AEGIS_TLS_IDENTITY does not match the configured AegisSRE role")
+		}
+		for name, value := range map[string]string{
+			"AEGIS_PUBLIC_URL":       c.PublicURL,
+			"AEGIS_OBSERVE_MCP_URL":  c.ObserveMCPURL,
+			"AEGIS_OPERATE_MCP_URL":  c.OperateMCPURL,
+			"AEGIS_INVESTIGATOR_URL": c.InvestigatorURL,
+			"AEGIS_OPERATOR_URL":     c.OperatorURL,
+		} {
+			parsed, _ := url.Parse(value)
+			if parsed == nil || parsed.Scheme != "https" {
+				return fmt.Errorf("%s must use https when AEGIS_MTLS_ENABLED=true", name)
+			}
+		}
+	}
+	if (!c.DryRun || c.AllowMutations) && c.Role != "test" && !c.MTLSEnabled {
+		return errors.New("AEGIS_MTLS_ENABLED=true is required for live action-plane configuration")
+	}
+	if (c.MTLSEnabled || !c.DryRun || c.AllowMutations) &&
+		(c.Role == "monitor" || c.Role == "operator" || c.Role == "mcp-action") &&
+		c.DatabaseURL == "" && c.DatabaseURLFile == "" {
+		return errors.New("durable PostgreSQL state is required for an authenticated production Monitor, Operator, or action MCP")
+	}
+	if (c.MTLSEnabled || !c.DryRun || c.AllowMutations) &&
+		(c.Role == "monitor" || c.Role == "operator" || c.Role == "mcp-read" || c.Role == "mcp-action") &&
+		strings.TrimSpace(c.WorkloadPolicyPath) == "" {
+		return errors.New("AEGIS_WORKLOAD_POLICY_FILE is required for authenticated production control-plane configuration")
+	}
+	if c.MTLSEnabled {
+		switch c.Role {
+		case "monitor":
+			if c.DelegationPrivateKeyFile == "" {
+				return errors.New("AEGIS_DELEGATION_PRIVATE_KEY_FILE is required for an authenticated production Monitor")
+			}
+		case "operator", "mcp-action":
+			if c.DelegationPublicKeysFile == "" {
+				return errors.New("AEGIS_DELEGATION_PUBLIC_KEYRING_FILE is required for an authenticated production verifier")
+			}
+		}
+	}
 	if c.LLMBaseURL != "" && (c.LLMModel == "" || strings.TrimSpace(c.LLMAPIKey) == "") {
 		return errors.New("AEGIS_LLM_MODEL and AEGIS_LLM_API_KEY are required when AEGIS_LLM_BASE_URL is set")
 	}
-	if c.WhatsAppMaxRetries < 0 || c.WhatsAppMaxRetries > 5 {
-		return errors.New("AEGIS_WHATSAPP_MAX_RETRIES must be between zero and five")
-	}
 	if c.WhatsAppEnabled && c.Role == "operator" {
+		if c.DatabaseURL == "" && c.DatabaseURLFile == "" {
+			return errors.New("AEGIS_WHATSAPP_ENABLED requires a durable PostgreSQL outbox")
+		}
 		for name, value := range map[string]string{
 			"AEGIS_WHATSAPP_PHONE_NUMBER_ID": c.WhatsAppPhoneID,
 			"AEGIS_WHATSAPP_ACCESS_TOKEN":    c.WhatsAppAccessToken,
@@ -239,6 +384,9 @@ func (c Config) Validate() error {
 	}
 	if c.Backend == "fixture" && c.FixturePath == "" {
 		return errors.New("AEGIS_FIXTURE_PATH is required for the fixture backend")
+	}
+	if c.Role == "mcp-action" && c.Backend == "fixture" && (!c.DryRun || c.AllowMutations) {
+		return errors.New("the fixture action backend is restricted to dry-run development; live action requires Kubernetes")
 	}
 	return nil
 }
@@ -309,6 +457,48 @@ func validateHTTPURL(name, value string) error {
 		return fmt.Errorf("%s must be an http(s) URL without user information", name)
 	}
 	return nil
+}
+
+func workloadIdentity(trustDomain, namespace, role string) (string, error) {
+	serviceAccount := ""
+	switch role {
+	case "monitor":
+		serviceAccount = "aegis-monitor"
+	case "investigator":
+		serviceAccount = "aegis-investigator"
+	case "operator":
+		serviceAccount = "aegis-operator"
+	case "mcp-read":
+		serviceAccount = "aegis-mcp-read"
+	case "mcp-action":
+		serviceAccount = "aegis-mcp-action"
+	default:
+		return "", fmt.Errorf("mTLS is unsupported for role %q", role)
+	}
+	return "spiffe://" + trustDomain + "/ns/" + namespace + "/sa/" + serviceAccount, nil
+}
+
+func validDNSName(value string, allowDots bool) bool {
+	if value == "" || len(value) > 253 || value[0] == '-' || value[len(value)-1] == '-' {
+		return false
+	}
+	for _, character := range value {
+		if (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') ||
+			character == '-' || allowDots && character == '.' {
+			continue
+		}
+		return false
+	}
+	return !strings.Contains(value, "..")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func env(name, fallback string) string {

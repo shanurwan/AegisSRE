@@ -15,6 +15,7 @@ const (
 	ToolGetWorkloadSnapshot  = "k8s_get_workload_snapshot"
 	ToolGetPodLogs           = "k8s_get_pod_logs"
 	ToolExecuteRemediation   = "k8s_execute_remediation"
+	ToolGetRemediationResult = "k8s_get_remediation_result"
 	ToolGetRemediationStatus = "k8s_get_remediation_status"
 )
 
@@ -181,6 +182,38 @@ type ExecuteRemediationInput struct {
 
 type ExecuteRemediationOutput struct {
 	Receipt model.ActionReceipt `json:"receipt"`
+}
+
+// RemediationExecutionState is the read-only durable state of the exact
+// signed delegation at the action MCP boundary. It intentionally does not
+// expose lease ownership or tokens.
+type RemediationExecutionState string
+
+const (
+	RemediationNotFound  RemediationExecutionState = "not_found"
+	RemediationReserved  RemediationExecutionState = "reserved"
+	RemediationCompleted RemediationExecutionState = "completed"
+	RemediationUncertain RemediationExecutionState = "uncertain"
+)
+
+func (s RemediationExecutionState) Valid() bool {
+	switch s {
+	case RemediationNotFound, RemediationReserved, RemediationCompleted, RemediationUncertain:
+		return true
+	default:
+		return false
+	}
+}
+
+type GetRemediationResultInput struct {
+	Grant model.DelegationGrant `json:"grant"`
+}
+
+// GetRemediationResultOutput includes a receipt only for a completed exact
+// fingerprint match. All other states deliberately carry no execution data.
+type GetRemediationResultOutput struct {
+	State   RemediationExecutionState `json:"state"`
+	Receipt *model.ActionReceipt      `json:"receipt,omitempty"`
 }
 
 type GetRemediationStatusInput struct {

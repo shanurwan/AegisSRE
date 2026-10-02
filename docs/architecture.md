@@ -4,7 +4,7 @@
 
 AegisSRE separates incident detection, diagnosis, authorization, and execution so that no reasoning component has ambient infrastructure authority. The system is autonomous inside explicit policy boundaries; it is not autonomous in defining those boundaries.
 
-This document describes the implemented pre-release architecture and its invariants. The executable composes all five services. Deterministic in-process control-plane E2E tests cross real MCP, A2A, and notification HTTP boundaries, covering a successful signed live fixture recovery and an outside-authority escalation with zero action calls; a separate integration test covers safe dry-run delegation. These tests are not separate-process Compose or live-k3s E2E. Production identity, durable shared state, OTLP export, and live-cluster validation are still outside the implemented assurance boundary.
+This document describes the implemented pre-release architecture and its invariants. The executable composes all five services. Deterministic control-plane E2E tests cross real MCP, A2A, and notification HTTP boundaries, and PostgreSQL integration tests exercise concurrent leases, replay recovery, audit insertion, and outbox transitions against a real database. Strict mTLS identity, keyring verification, exact workload policy binding, OTLP trace export, and durable action/report state are implemented. These tests are not a live-k3s acceptance claim; the checked-in laboratory runner has not been executed against the target cluster.
 
 ## Context
 
@@ -23,14 +23,17 @@ flowchart TB
     M -->|fresh verification| OMCP
     M -->|terminal report request| O
     O -->|sanitized template| WA[WhatsApp Cloud API]
-    M -. planned / unwired .-> OTEL[OTLP collector]
-    I -.-> OTEL
-    O -.-> OTEL
-    OMCP -.-> OTEL
-    AMCP -.-> OTEL
+    M -->|OTLP/HTTP traces| OTEL[OTLP collector]
+    I -->|OTLP/HTTP traces| OTEL
+    O -->|OTLP/HTTP traces| OTEL
+    OMCP -->|OTLP/HTTP traces| OTEL
+    AMCP -->|OTLP/HTTP traces| OTEL
+    M --> PG[(PostgreSQL control state)]
+    O --> PG
+    AMCP --> PG
 ```
 
-The dashed edges show the intended AegisSRE observability path, not current behavior. The binary exposes Prometheus process/build metrics at `/metrics`, but it does not initialize an OTLP exporter. Checked-in runtime configuration supplies neither OTEL settings nor collector egress. A future exporter must never carry private keys, bearer tokens, raw authorization headers, or unredacted sensitive log content.
+Every process installs W3C Trace Context and baggage propagation. When a standard `OTEL_EXPORTER_OTLP_*_ENDPOINT` is configured, the binary initializes a bounded batch trace exporter; otherwise it uses a no-op provider. The production overlays configure OTLP/HTTP trace export to the in-cluster collector and restrict egress to that labeled destination. JSON stdout remains the only application-log export path, with `trace_id` and `span_id` added when a valid span is active. Instrumentation must never carry private keys, bearer tokens, raw authorization headers, or unredacted sensitive log content.
 
 ## Agent responsibilities
 
@@ -69,7 +72,7 @@ The deterministic heuristic reasoner is the default. When `AEGIS_LLM_BASE_URL`, 
 
 Operator translates a valid delegation into one typed action request.
 
-1. Require a structured remediation envelope declaring Monitor as sender. Authenticated workload identity is still a deployment/implementation gap.
+1. Require a structured remediation envelope from the authenticated Monitor workload identity; the envelope sender must match that identity.
 2. Validate the delegation signature, audience, time window, incident binding, exact parameters, and replay state.
 3. Reject anything outside the configured namespace and action allowlists.
 4. Call `k8s_execute_remediation` with dry-run preserved.
@@ -91,6 +94,7 @@ The split is a security boundary, not a naming convention.
 | Kubernetes identity | Read-only | Minimal namespace-scoped write identity |
 | Telemetry access | Victoria APIs and bounded pod logs | None; its bounded status tool reads only the exact grant-marked Deployment |
 | Delegation required | No | Yes, validated on every action/status request |
+| Exact policy | Target and signal-source authorization on every read | Target, action, parameter bounds, and signed policy digest |
 | Failure mode | Lose evidence | Lose automation; never fail open |
 
 Deploy the planes as separate workloads and ServiceAccounts in Kubernetes. A single development process may host both for fixture mode, but production credentials must remain separated.
@@ -106,14 +110,15 @@ The current typed names are:
 - `k8s_get_workload_snapshot`
 - `k8s_get_pod_logs`
 
-Callers select template identifiers; the server owns PromQL/LogsQL, windows, grouping, timeout, and response caps. Autonomous log/trace detection accepts only results with exact namespace and Deployment identity. Log searches are constrained by namespace, time window, line count, and result bytes. Kubernetes snapshots are structured summaries rather than arbitrary object retrieval.
+Callers select template identifiers; the server owns PromQL/LogsQL, windows, grouping, timeout, and response caps. In authenticated production mode the same exact workload policy gates the read MCP: namespace scans fan out only to authorized targets/signal sources, and foreign result identities fail closed. Pod-log access proves the current Pod -> ReplicaSet -> Deployment controller chain and both owner UIDs before matching the exact target. Log searches remain constrained by namespace, time window, line count, and result bytes. Kubernetes snapshots are structured summaries rather than arbitrary object retrieval.
 
 ### Action catalog
 
 - `k8s_execute_remediation`
+- `k8s_get_remediation_result`
 - `k8s_get_remediation_status`
 
-An action is a closed domain type, such as restarting or scaling a named Deployment. It is not a free-form verb, resource, patch, or command. The `tools/list` response is authoritative for tools currently available at runtime.
+An action is a closed domain type, such as restarting or scaling a named Deployment. It is not a free-form verb, resource, patch, or command. `k8s_get_remediation_result` is a non-authorizing exact-fingerprint lookup used to recover a durable receipt after an Operator crash; it does not acquire a lease, refresh a grant, read Kubernetes, or mutate state. The `tools/list` response is authoritative for tools currently available at runtime.
 
 ## Clean Architecture
 
@@ -148,7 +153,7 @@ Outbound adapters implement ports for:
 - deterministic or model-backed reasoners.
 - WhatsApp Cloud API delivery for sealed, sanitized terminal reports.
 
-Detection, pending-verification, and cooldown tracking, replay guards, action-receipt caches, and audit output are currently process-local. No durable shared store adapter is implemented.
+Fixture mode keeps detection/replay/report state in process memory. With PostgreSQL configured, runtime composition instead uses fenced Monitor leadership/checkpoints, independently scoped Operator and action-MCP execution ledgers, durable receipts and uncertain outcomes, append-only audit records, and atomic incident-report/outbox insertion. Operator and action MCP do not share a replay scope: each must consume and verify its own grant audience.
 
 Inbound adapters under `internal/transport` map A2A and MCP messages to application/domain types. They validate envelopes before invoking a use case and map domain errors to protocol errors.
 
@@ -212,7 +217,7 @@ sequenceDiagram
     O-->>M: report + independent notification receipt
 ```
 
-Domain envelopes carry the incident and correlation IDs across agent hops. W3C trace-context propagation and AegisSRE's own OTLP export are not wired yet. A receipt records an API outcome, not recovery. After a successful live action, Monitor checks availability immediately. An unhealthy result or read error stores the original remediating incident as process-local `verification_pending` state; every scheduled scan checks pending targets before new detection queries, even if the alert fingerprint is no longer emitted. These retries observe only and never resend the mutation. Recovery resolves the same incident. If the window, whose length is `AEGIS_INCIDENT_COOLDOWN`, elapses without recovery, the same incident becomes terminal `escalated`. Clearing either terminal result begins a fresh workload cooldown; only after it expires may a persistent signal be reconfirmed as a new incident. Dry-run instead escalates immediately without inferring recovery. WhatsApp failure affects only its notification receipt; it never rewrites the terminal incident state.
+Domain envelopes carry incident and correlation IDs across agent hops, while instrumented HTTP transports propagate W3C trace context independently of authorization identity. A receipt records an API outcome, not recovery. After a successful live action, Monitor checks availability immediately. An unhealthy result or read error stores the original remediating incident as `verification_pending`; every scheduled scan checks pending targets before new detection queries, even if the alert fingerprint is no longer emitted. These retries observe only and never resend the mutation. In durable mode, Monitor checkpoints detection, dispatch, pending-verification, report, and cooldown state under a fenced namespace leadership lease so another replica can resume only after takeover. Recovery resolves the same incident. If the cooldown-length verification window elapses without recovery, the incident becomes terminal `escalated`. Dry-run escalates without inferring recovery. WhatsApp failure affects only notification state and never rewrites the incident result.
 
 ## A2A v1.0 binding
 
@@ -224,7 +229,7 @@ AegisSRE uses the official A2A data model rather than an internal HTTP protocol 
 - The current adapter uses the official Go SDK's JSON-RPC binding at `/a2a`, requires exactly one structured data part, and refuses an Agent Card that redirects the client to a different origin.
 - Incident exchanges use A2A tasks/messages and structured data parts; free-form prose is supplementary, never the authorization contract.
 - Task/message IDs and incident IDs are related but distinct. Duplicate delivery of one remediation request preserves its incident and grant IDs; a later Monitor recurrence after cooldown is not a retry and receives a new incident ID.
-- Authentication, authorization, and TLS remain deployment responsibilities and must match the schemes advertised by the Agent Card.
+- In authenticated mode, Agent Cards require mutual TLS. Clients reject cards that omit it, the server verifies TLS 1.3 client certificates before body decoding, and the A2A envelope sender must match the authorized certificate principal.
 
 The pinned `a2a-go` module version is an implementation dependency, not the advertised protocol version.
 
@@ -236,23 +241,22 @@ MCP is served over stateless Streamable HTTP, conventionally at `/mcp`.
 - Clients identify `2026-07-28` using `MCP-Protocol-Version` and protocol metadata as defined by the specification.
 - `Mcp-Method` and, when applicable, `Mcp-Name` must agree with the JSON-RPC body.
 - Discovery and list results may be cached only within their declared lifetime/scope.
-- Future trace-context propagation should use the MCP-defined `_meta` keys; the current transport does not add W3C trace context.
+- Instrumented HTTP clients and servers propagate W3C `traceparent`, `tracestate`, and baggage across MCP requests; trace data is never accepted as caller identity.
 - Tool inputs and outputs are typed and validated before reaching an adapter.
 - The current server is configured stateless with JSON responses and a 1 MiB request-body limit.
 
-Authentication is still required. Stateless means horizontally routable, not unauthenticated or replay-safe.
+Mutual TLS authenticates each allowed MCP caller in production mode. Stateless means horizontally routable, not replay-safe; replay/execution safety comes from the signed grant and durable scoped execution ledger.
 
 ## Data ownership and state
 
 | Data | System of record | Retention expectation |
 |---|---|---|
 | Raw platform telemetry | Victoria backends / Kubernetes | Controlled by the platform |
-| Incident outcome | Returned from the current scan and written to process logs | No durable incident record is implemented |
-| Detection/pending-verification/cooldown tracker | Process-local Monitor memory | Lost on restart; pending incident context and observation schedule are not durable, and recurrence after cooldown creates a new incident |
-| Delegation replay IDs | Process-local guards in Operator and action MCP | Independent today and lost on restart; production storage must retain them through grant expiry plus any skew window |
-| Audit events | Structured JSON process log | Current implementation only; production needs a durable append-only sink |
-| Action receipt | Process-local caches in Operator and action MCP, A2A response, and process log | Lost on restart; durable incident/audit retention is not implemented |
-| Incident report / notification dedupe | Bounded process-local Operator cache keyed by report request ID | Prevents duplicates until eviction/restart; production requires a durable outbox |
+| Active Monitor workflow | PostgreSQL fenced checkpoint when configured; memory in fixture mode | Persists confirmation, dispatch, verification, reporting, and cooldown state; it is an operational checkpoint, not a historical incident archive |
+| Delegation consumption | PostgreSQL execution ledger, independently keyed by `operator` and `mcp_action` scope | Completed and uncertain records default to 90-day retention; cleanup is an explicit operational task |
+| Action receipt | PostgreSQL execution ledger plus A2A response | Exact completed results can be recovered after grant expiry without reopening authorization |
+| Audit events | Append-only PostgreSQL table in durable mode; structured JSON in fixture mode | Database grants/retention/export are deployment-owned; runtime roles must not receive update/delete/truncate |
+| Incident report / notification | PostgreSQL report and transactional outbox tables when WhatsApp is enabled | Exact request/report dedupe survives restart; delivered-row cleanup and dead-letter operations are explicit |
 
 Raw telemetry should be referenced by query/time range and digest where possible instead of copied indefinitely into incident state.
 
@@ -260,16 +264,18 @@ Raw telemetry should be referenced by query/time range and digest where possible
 
 - **Detection query unavailable:** existing pending verifications are attempted first; the detection query then returns an error, the polling loop logs it, and the next scheduled scan tries again. A failed candidate query creates no new incident.
 - **Investigator unavailable before a grant:** the current incident outcome becomes `failed`, consecutive confirmation resets, and a later signal must be reverified as a new incident.
-- **Operator/action response unavailable or unverifiable after a grant:** the current incident becomes terminal `escalated` with reason `action_outcome_unverified`, the fingerprint enters cooldown, and Monitor does not automatically resend the grant. A `failed` state requires a validated failed or rolled-back receipt.
+- **Monitor crashes before persisting an action dispatch:** a replacement may repeat investigation, but no grant could have been sent before the exact signed remediation envelope was checkpointed. Once checkpointed, only that byte-equivalent envelope is resumed.
+- **Operator/action response unavailable after a grant:** durable Monitor mode retries only the checkpointed, byte-equivalent grant envelope. Operator's execution ledger returns an exact stored receipt without repeating the side effect. If action MCP committed first and Operator crashed before its own commit, a replacement takes over only the expired Operator lease and uses `k8s_get_remediation_result` to recover the exact downstream receipt even after grant expiry or policy change. `not_found` can execute only after fresh Operator authorization; if that authorization fails, Operator records `uncertain` because a canceled predecessor may still be accepted after the lookup miss. For `reserved`, Operator re-enters only the exact action endpoint: action MCP atomically rejects a live lease or takes over an expired lease, reconciles the Kubernetes grant marker, and requires fresh action-MCP authorization before any retry-safe mutation. A recovered retry that current authorization or the mutation switch denies becomes `uncertain`, never a no-mutation rejection. Durable leases must exceed the request timeout by more than the ten-second persistence margin; this bounds Aegis-owned overlap but cannot prove the Kubernetes API server will not accept an already-sent canceled request late. A replay/transport error or Operator receipt-commit acknowledgement failure leaves the Operator reservation recoverable; only a durable downstream `uncertain` state or an invalid authenticated receipt makes it uncertain. If the bounded incident window expires without a recoverable receipt, the incident becomes terminal `escalated` with reason `action_outcome_unverified`. An invalid response is rejected and escalated immediately. A `failed` state requires a validated failed or rolled-back receipt.
 - **Grant validation disagreement:** reject the action and emit an audit event. Never choose the more permissive result.
-- **Duplicate remediation delivery:** process-local receipt caches return a completed result. If Operator consumed a live grant but lost the receipt, it may query exact remediation status and synthesize success only when the signed postcondition is satisfied; a dry-run replay or unsatisfied status is rejected.
+- **Duplicate remediation delivery:** an exact completed ledger entry returns its durable receipt, including after signed expiry. A live reservation whose lease expired is reconciled against the exact Kubernetes grant marker/postcondition before takeover; ambiguous results become terminal `uncertain` and are never blindly re-executed. Changed signed content using the same grant or idempotency key fails closed.
+- **Notification delivery ambiguity:** report and outbox insertion is atomic, but provider acceptance and the database acknowledgement cannot share a transaction. The worker therefore provides at-least-once delivery: a crash in that window may send the same template twice. Retries use bounded backoff and move to `dead_letter` after the configured attempt limit.
 - **Post-action verification not yet healthy:** the original incident remains remediating with status `verification_pending`; each scheduled scan retries the bounded snapshot and blocks redelegation. It resolves on a healthy result or transitions to terminal `escalated` when the cooldown-length verification window expires. No action is retried.
 
 ## Target deployment
 
 The checked-in Kubernetes topology is three agent Deployments plus two MCP Deployments, all built from one image and selected by mode/configuration. Kubernetes credentials are mounted only into the matching MCP workload. The manifests include separate ServiceAccounts, namespace Roles, Services, security contexts, and default-deny NetworkPolicies.
 
-That makes the topology reviewable, and the local fixture path has end-to-end integration coverage. It does not show that the workloads have been deployed to k3s, that live Victoria/Kubernetes schemas and permissions work, or that OTLP export exists. See [deployment.md](deployment.md).
+The production overlay adds TLS/key/policy/database mounts, a migration Job, collector and PostgreSQL egress, and an intentionally invalid image/target sentinel. The laboratory overlay narrows RBAC and policy to one canary, and its execute child enables the two live mutation gates. This makes the topology reviewable; it does not show that the workloads have been deployed to k3s, that the live Victoria/Kubernetes schemas and permissions work, or that the gated acceptance runner has passed. See [deployment.md](deployment.md).
 
 ## Protocol references
 

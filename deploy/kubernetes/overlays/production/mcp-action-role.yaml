@@ -1,0 +1,11 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aegis-mcp-action
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    # Kubernetes independently confines action MCP even if application policy
+    # is misconfigured. Replace only in a reviewed workload-specific overlay.
+    resourceNames: ["replace-before-live"]
+    verbs: ["get", "patch"]

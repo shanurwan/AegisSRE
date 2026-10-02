@@ -1,7 +1,9 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
 ARG GO_VERSION=1.26.8
-FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm AS build
+# Keep GO_VERSION and this digest in lockstep. The digest makes the build input
+# immutable even if the upstream convenience tag moves.
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm@sha256:a688600ca24f8a4d3ca77f95b0dd40704a9fc787c826660eb7ba0b641b8b175d AS build
 
 WORKDIR /src
 
@@ -19,7 +21,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go build -buildvcs=false -trimpath -ldflags="-s -w" \
     -o /out/aegissre ./cmd/aegissre
 
-FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab AS runtime
 
 LABEL org.opencontainers.image.title="AegisSRE" \
       org.opencontainers.image.description="Constrained autonomous reliability agents" \
@@ -28,5 +30,5 @@ LABEL org.opencontainers.image.title="AegisSRE" \
 COPY --from=build --chown=65532:65532 /out/aegissre /usr/local/bin/aegissre
 
 USER 65532:65532
-EXPOSE 8080
+EXPOSE 8080 8443 9090
 ENTRYPOINT ["/usr/local/bin/aegissre"]

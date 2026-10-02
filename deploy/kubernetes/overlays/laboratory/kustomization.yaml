@@ -1,0 +1,27 @@
+# Safe laboratory profile: exact canary authority, signed delegation required,
+# but Kubernetes mutation remains disabled. Use ./execute only for the explicit
+# opt-in acceptance exercise.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: outage-arena
+resources:
+  - ../production
+configMapGenerator:
+  - name: aegis-workload-policy
+    behavior: replace
+    files:
+      - policy.json=workload-policy.json
+generatorOptions:
+  labels:
+    app.kubernetes.io/part-of: aegissre
+patches:
+  - path: mcp-read-role.yaml
+  - path: mcp-action-role.yaml
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+    patch: |-
+      - op: replace
+        path: /spec/template/metadata/annotations/aegissre.io~1release-profile
+        value: laboratory

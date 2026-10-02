@@ -37,6 +37,7 @@ type DelegationGrant struct {
 	IncidentID          string              `json:"incident_id"`
 	DiagnosisReportID   string              `json:"diagnosis_report_id"`
 	DiagnosisDigest     string              `json:"diagnosis_digest"`
+	PolicyDigest        string              `json:"policy_digest,omitempty"`
 	DiagnosisConfidence float64             `json:"diagnosis_confidence"`
 	EvidenceIDs         []string            `json:"evidence_ids"`
 	ProposalID          string              `json:"proposal_id"`
@@ -71,6 +72,11 @@ func (g DelegationGrant) Validate() error {
 	}
 	if err := validateDigest("grant.diagnosis_digest", g.DiagnosisDigest); err != nil {
 		return err
+	}
+	if g.PolicyDigest != "" {
+		if err := validateDigest("grant.policy_digest", g.PolicyDigest); err != nil {
+			return err
+		}
 	}
 	if err := validateConfidence(g.DiagnosisConfidence); err != nil {
 		return err

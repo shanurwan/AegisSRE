@@ -6,7 +6,7 @@ AegisSRE is a three-agent reliability system for Kubernetes. Monitor detects and
 
 The safety boundary is deliberate: diagnosis does not imply permission, and permission does not imply execution. Live mutations require a short-lived, incident-bound Ed25519 delegation that both Operator and the action MCP server validate independently. Dry-run is the default.
 
-> **Project status:** pre-release. The executable, three agent services, two MCP profiles, fixture/Victoria/Kubernetes adapters, A2A/MCP transports, terminal reporting, opt-in WhatsApp adapter, Compose topology, and Kustomize manifests are implemented. Deterministic control-plane E2E tests cross real MCP, A2A, and notification HTTP boundaries for both a signed live fixture recovery and an outside-authority escalation; the default dry-run path is tested separately. This is not a separate-process or live-k3s E2E claim. Live k3s telemetry schemas, WhatsApp credentials/templates and egress, independent protocol conformance, durable shared incident/replay/report state, authenticated transport and TLS, key rotation, OTLP export, and workload-specific policy remain to be implemented or validated before use.
+> **Project status:** pre-release. The control plane, strict workload mTLS, exact workload policy binding, overlapping delegation-key verification, OTLP trace export, and PostgreSQL-backed Monitor/execution/audit/report-outbox paths are implemented and tested in repository scope. Deterministic E2E tests cross real MCP, A2A, and notification HTTP boundaries; PostgreSQL integration tests exercise competing owners, replay recovery, leases, and outbox transitions against a real PostgreSQL service in CI. This is not a live-k3s acceptance claim. The gated laboratory runner is checked in, but it has not been executed against `laboratory`; production images, certificates/secrets, external HA PostgreSQL, authoritative collector identity enrichment, and restricted WhatsApp egress are not provisioned by this repository.
 
 ## System shape
 
@@ -48,7 +48,7 @@ Monitor is schedule-driven: it scans immediately at startup and then every `AEGI
 
 - **A2A v1.0:** Agent Cards advertise the three roles; tasks, messages, and structured data parts carry incident requests, evidence, diagnoses, delegation envelopes, and receipts. Requests use protocol version `1.0` rather than an SDK version number.
 - **MCP 2026-07-28:** stateless Streamable HTTP at `/mcp`. Requests carry the negotiated protocol version and routable method/name headers required by the specification. No long-lived MCP session is part of the security design.
-- **Runtime telemetry:** every process serves `/healthz`, a shallow `/readyz`, and Prometheus process/build metrics at `/metrics`. OTLP export is not wired; the checked-in local and Kubernetes configurations supply neither OTEL settings nor collector egress.
+- **Runtime telemetry:** every process serves `/healthz`, `/readyz`, and Prometheus process/build metrics at `/metrics`. W3C Trace Context and baggage propagate across instrumented HTTP calls. Setting a standard OTLP HTTP trace endpoint enables bounded batched export; the production overlays route it only to the in-cluster collector. PostgreSQL consumers report not-ready when the database or embedded schema check fails.
 
 SDK versions are pinned in [`go.mod`](go.mod). Protocol conformance is a separate claim and must be demonstrated by tests; importing an SDK alone is not evidence of conformance.
 
@@ -68,6 +68,7 @@ The typed contracts live under `internal/toolapi`. The initial bounded catalog i
 **Action plane**
 
 - `k8s_execute_remediation` — accepts a signed grant and an explicit dry-run request.
+- `k8s_get_remediation_result` — performs an exact, read-only durable-result lookup for crash recovery; it never reserves or executes an action.
 - `k8s_get_remediation_status` — verifies whether the grant's intended state has been reached.
 
 There is intentionally no raw shell, `exec`, arbitrary query, generic patch, generic manifest apply, secret read, or unconstrained delete tool.
@@ -114,6 +115,19 @@ docker compose up --build
 
 See [the demo guide](docs/demo.md) for the implemented fixture workflow and its validation limits.
 
+## Production controls
+
+The production and laboratory overlays add controls intentionally omitted from the local fixture topology:
+
+- TLS 1.3 mutual authentication on application port `8443`, with a separate health-only admin listener on `9090`;
+- an exact caller matrix derived from the certificate's sole URI SAN, enforced before A2A/MCP request-body decoding;
+- a strict JSON workload policy shared by Monitor, Operator, read MCP, and action MCP, whose effective digest is sealed into every grant;
+- a PostgreSQL migration job and role-separated connection Secrets for Monitor, Operator, and action MCP;
+- durable Monitor leadership/checkpoints, scoped Operator/action-MCP execution ledgers, append-only audit records, and a transactional notification outbox;
+- OTLP/HTTP trace export to the in-cluster collector plus default-deny, destination-specific NetworkPolicies.
+
+The production overlay is a deliberately non-deployable scaffold: its zero image digest and `replace-before-live` workload must be replaced. The laboratory overlays bind policy and RBAC to the single `aegissre-e2e-canary`. Render and validate them with `make manifest-policy-overlays`; the live runner additionally requires the exact `laboratory` context, `outage-arena` namespace, canary name, pinned image digest, and explicit acknowledgement. It is never run by ordinary CI.
+
 ## Outage Arena integration
 
 The target k3s environment exposes these telemetry endpoints:
@@ -125,7 +139,7 @@ The target k3s environment exposes these telemetry endpoints:
 | Traces | `http://vtraces.observability.svc.cluster.local:10428` | VictoriaTraces; AegisSRE appends the bounded LogsQL stats API path, 7-day retention |
 | OTLP | `http://otel-collector.observability.svc.cluster.local:4318` | HTTP OTLP ingress; gRPC is available on port `4317` |
 
-The read MCP consumes VictoriaMetrics, VictoriaLogs, and VictoriaTraces. Log detection requires the canonical `aegissre.io/workload` pod label in the collected stream, and trace detection requires `k8s.namespace.name` plus `k8s.deployment.name` resource attributes. Missing or mismatched identity fails closed. The arena's current collector does not add those trace attributes, so validate/enrich its OTEL pipeline before relying on trace incidents. AegisSRE's own OTLP export is not wired.
+The read MCP consumes VictoriaMetrics, VictoriaLogs, and VictoriaTraces. Exact workload policy filters autonomous observations to configured targets and signal sources. Log detection still requires the canonical `aegissre.io/workload` identity in the collected stream, and trace detection requires `k8s.namespace.name` plus `k8s.deployment.name` resource attributes. Missing or mismatched identity fails closed. The sibling outage-arena collector may not yet add those authoritative attributes, so validate or enrich that independently owned pipeline before relying on log/trace incidents. AegisSRE exports its own traces through OTLP when the standard endpoint variables are configured; it does not export application logs a second time.
 
 The arena currently has no workload scenarios or alert rules under `apps/laboratory`; AegisSRE must not imply otherwise. Deployment also requires infra-owned read RBAC for cluster evidence and a separate, minimal action Role in `outage-arena`. Details are in [deployment](docs/deployment.md).
 
@@ -135,15 +149,15 @@ The arena currently has no workload scenarios or alert rules under `apps/laborat
 - Live Operator execution is separately disabled by default.
 - Log- and trace-triggered incidents are detected and investigated, but cannot authorize a live mutation unless `AEGIS_ALLOW_LOG_TRACE_ACTIONS=true`; keep it false until workload identity is collector-owned and verified.
 - Only allowlisted namespaces, actions, metric/log/trace templates, and bounded log searches are accepted.
-- Grants are incident-bound, audience-bound, exact-parameter-bound, short-lived, and replay-protected.
-- `AEGIS_DELEGATION_KEY_ID` must identify the same key on Monitor, Operator, and action MCP; the default is `aegissre-monitor-v1`.
+- Grants are incident-bound, audience-bound, exact-parameter-bound, short-lived, policy-digest-bound, and replay-protected.
+- `AEGIS_DELEGATION_KEY_ID` identifies Monitor's active signing key. Production verifiers load a bounded public-key ring and accept overlapping key IDs during rotation; unknown or retired IDs fail closed.
 - A scale request must strictly increase the signed expected replica count; no-op scaling and scale-down are denied. Defaults cap the request at 20 total replicas and the increase at 5, controlled by `AEGIS_MAX_SCALE_REPLICAS` and `AEGIS_MAX_SCALE_INCREASE`.
 - Operator and action MCP validate every grant independently.
 - Investigator defines the bounded action intent; only Monitor delegates authority. A proposal alone can never reach the action MCP.
 - Monitor authorizes every terminal report request with a distinct, short-lived Ed25519 signature; Operator verifies it before report creation or notification, so an A2A sender claim alone cannot trigger WhatsApp.
 - Every resolved, escalated, or failed terminal outcome is eligible for a non-authoritative Operator report, including rejected actions, validated action failures, and action outcomes that could not be verified. Ambiguous post-delegation outcomes escalate instead of being mislabeled as failures. WhatsApp delivery status is separate from incident state, so notification failure cannot rewrite the reliability result.
 - The Monitor signing key is never mounted in Investigator, Operator, or either Kubernetes tool plane.
-- Implemented investigation, authorization, and action paths emit structured audit events to JSON process logs; a durable append-only audit sink and full decision coverage remain production work.
+- Operator and action MCP use a PostgreSQL append-only audit sink in durable mode and require the audit intent before a live write. Local fixture mode retains structured JSON audit output. Retention/export and full decision coverage remain deployment responsibilities.
 - Before delegation, a fresh healthy snapshot resolves the incident without action. After a successful live action, Monitor observes immediately; if the target is not yet healthy, the same incident remains `verification_pending` and scheduled scans retry observation without retrying the action. It resolves on recovery or escalates when the `AEGIS_INCIDENT_COOLDOWN` verification window elapses.
 
 Read the complete [security model](docs/security-model.md) before enabling a write path.

@@ -1,0 +1,18 @@
+{
+  "schema_version": "aegissre.io/workload-policy/v1",
+  "policy_id": "laboratory-canary-v1",
+  "workloads": [
+    {
+      "target": {
+        "api_version": "apps/v1",
+        "kind": "Deployment",
+        "namespace": "outage-arena",
+        "name": "aegissre-e2e-canary"
+      },
+      "allowed_actions": ["restart_deployment"],
+      "allowed_signal_sources": ["metrics"],
+      "maximum_replicas": 1,
+      "maximum_replica_increase": 1
+    }
+  ]
+}

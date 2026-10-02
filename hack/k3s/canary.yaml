@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: __CANARY_NAME__
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/name: __CANARY_NAME__
+    app.kubernetes.io/component: acceptance-canary
+    app.kubernetes.io/managed-by: aegissre-e2e
+  annotations:
+    aegissre.io/e2e-run: __RUN_ID__
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: __CANARY_NAME__
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: __CANARY_NAME__
+        app.kubernetes.io/component: acceptance-canary
+        app.kubernetes.io/managed-by: aegissre-e2e
+        # VictoriaLogs collector-owned pod metadata exposes this exact label.
+        aegissre.io/workload: __CANARY_NAME__
+      annotations:
+        aegissre.io/e2e-run: __RUN_ID__
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: canary
+          image: __CANARY_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              while true; do
+                if [ -z "${GRANT_ID:-}" ]; then
+                  printf '{"severity_text":"ERROR","event_name":"dependency_timeout","message":"AegisSRE acceptance canary is intentionally unready","aegissre_e2e_run":"%s"}\n' "$RUN_ID"
+                else
+                  printf '{"severity_text":"INFO","event_name":"recovery","message":"AegisSRE acceptance canary recovered after its delegated restart","aegissre_e2e_run":"%s"}\n' "$RUN_ID"
+                fi
+                sleep 5
+              done
+          env:
+            - name: RUN_ID
+              value: __RUN_ID__
+            - name: GRANT_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['aegissre.io/grant-id']
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-ec", "test -n \"${GRANT_ID:-}\""]
+            initialDelaySeconds: 1
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 1
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-ec", "true"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      terminationGracePeriodSeconds: 5

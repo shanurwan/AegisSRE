@@ -103,33 +103,57 @@ func TestConstrainCardAcceptsOnlySameOriginJSONRPCInterfaces(t *testing.T) {
 	}
 }
 
+func TestConstrainCardRequiresDeclaredMutualTLS(t *testing.T) {
+	t.Parallel()
+	_, card, err := NewHandler(CardConfig{
+		Name: "investigator", Description: "mTLS agent", PublicURL: "https://investigator.internal",
+		SkillID: "investigate", SkillName: "Investigate", RequireMTLS: true,
+	}, func(context.Context, model.Envelope) (model.Envelope, error) { return model.Envelope{}, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := constrainCard("https://investigator.internal", card, true); err != nil {
+		t.Fatalf("mTLS card rejected: %v", err)
+	}
+	card.SecurityRequirements = nil
+	if err := constrainCard("https://investigator.internal", card, true); err == nil {
+		t.Fatal("card without an mTLS requirement was accepted")
+	}
+}
+
 func TestClientPreservesPeerErrorCode(t *testing.T) {
 	t.Parallel()
-	var application http.Handler
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		application.ServeHTTP(writer, request)
-	}))
-	defer server.Close()
-	var err error
-	application, _, err = NewHandler(CardConfig{
-		Name: "operator", Description: "test policy denial", PublicURL: server.URL,
-		SkillID: "operate", SkillName: "Operate",
-	}, func(context.Context, model.Envelope) (model.Envelope, error) {
-		return model.Envelope{}, model.NewError(model.CodePolicyDenied, "outside configured authority")
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	input, err := model.NewEnvelope(
-		"request", "incident", "correlation", "", model.AgentMonitor,
-		model.AgentOperator, model.MessageRemediationRequest, time.Now(), map[string]string{"test": "value"},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var output model.Envelope
-	err = NewClient(5*time.Second).Send(context.Background(), server.URL, input, &output)
-	if code, ok := model.ErrorCodeOf(err); !ok || code != model.CodePolicyDenied {
-		t.Fatalf("Send() error = %v, want preserved %s code", err, model.CodePolicyDenied)
+	for _, wantCode := range []model.ErrorCode{model.CodePolicyDenied, model.CodeExecutionPending} {
+		wantCode := wantCode
+		t.Run(string(wantCode), func(t *testing.T) {
+			t.Parallel()
+			var application http.Handler
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				application.ServeHTTP(writer, request)
+			}))
+			defer server.Close()
+			var err error
+			application, _, err = NewHandler(CardConfig{
+				Name: "operator", Description: "test structured peer error", PublicURL: server.URL,
+				SkillID: "operate", SkillName: "Operate",
+			}, func(context.Context, model.Envelope) (model.Envelope, error) {
+				return model.Envelope{}, model.NewError(wantCode, "bounded peer failure")
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			input, err := model.NewEnvelope(
+				"request", "incident", "correlation", "", model.AgentMonitor,
+				model.AgentOperator, model.MessageRemediationRequest, time.Now(), map[string]string{"test": "value"},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var output model.Envelope
+			err = NewClient(5*time.Second).Send(context.Background(), server.URL, input, &output)
+			if code, ok := model.ErrorCodeOf(err); !ok || code != wantCode {
+				t.Fatalf("Send() error = %v, want preserved %s code", err, wantCode)
+			}
+		})
 	}
 }

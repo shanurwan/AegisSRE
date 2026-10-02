@@ -65,27 +65,37 @@ func (r IncidentReportReason) Summary() string {
 
 // IncidentReportRequest is a sanitized Monitor request for Operator to create
 // and deliver a terminal report. It is informational and grants no Kubernetes
-// authority. GrantID and ReceiptID, when present, must be supplied together
-// and are matched against a receipt previously produced by Operator.
+// authority. Receipt-backed reasons carry both GrantID and ReceiptID. An
+// action_outcome_unverified request carries GrantID alone so durable report
+// acceptance can fence the exact post-delegation ambiguity without claiming a
+// receipt. Authority-exceeded may also carry GrantID alone when denial happened
+// after delegation; receipt-free pre-delegation denials carry neither.
 type IncidentReportRequest struct {
-	SchemaVersion     string                 `json:"schema_version"`
-	RequestID         string                 `json:"request_id"`
-	Issuer            AgentID                `json:"issuer"`
-	Audience          AgentID                `json:"audience"`
-	IncidentID        string                 `json:"incident_id"`
-	CorrelationID     string                 `json:"correlation_id"`
-	DiagnosisReportID string                 `json:"diagnosis_report_id"`
-	GrantID           string                 `json:"grant_id,omitempty"`
-	ReceiptID         string                 `json:"receipt_id,omitempty"`
-	Target            ResourceTarget         `json:"target"`
-	FinalState        IncidentState          `json:"final_state"`
-	Reason            IncidentReportReason   `json:"reason"`
-	RequestedAt       time.Time              `json:"requested_at"`
-	ExpiresAt         time.Time              `json:"expires_at"`
-	Signature         ReportRequestSignature `json:"signature"`
+	SchemaVersion     string               `json:"schema_version"`
+	RequestID         string               `json:"request_id"`
+	Issuer            AgentID              `json:"issuer"`
+	Audience          AgentID              `json:"audience"`
+	IncidentID        string               `json:"incident_id"`
+	CorrelationID     string               `json:"correlation_id"`
+	DiagnosisReportID string               `json:"diagnosis_report_id"`
+	GrantID           string               `json:"grant_id,omitempty"`
+	ReceiptID         string               `json:"receipt_id,omitempty"`
+	Target            ResourceTarget       `json:"target"`
+	FinalState        IncidentState        `json:"final_state"`
+	Reason            IncidentReportReason `json:"reason"`
+	// ReportCreatedAt is the immutable logical creation time of the terminal
+	// report. RequestedAt/ExpiresAt may rotate to renew transport authorization
+	// after response loss without changing this signed semantic timestamp.
+	ReportCreatedAt time.Time              `json:"report_created_at"`
+	RequestedAt     time.Time              `json:"requested_at"`
+	ExpiresAt       time.Time              `json:"expires_at"`
+	Signature       ReportRequestSignature `json:"signature"`
 }
 
-const MaxIncidentReportRequestTTL = 5 * time.Minute
+const (
+	IncidentReportRequestSchemaVersionV2 = "v2"
+	MaxIncidentReportRequestTTL          = 5 * time.Minute
+)
 
 // ReportRequestSignature is intentionally a distinct protocol type from a
 // delegation-grant signature. The security package also uses a separate
@@ -111,7 +121,7 @@ func (s ReportRequestSignature) Validate() error {
 }
 
 func (r IncidentReportRequest) Validate() error {
-	if r.SchemaVersion != SchemaVersionV1 {
+	if r.SchemaVersion != IncidentReportRequestSchemaVersionV2 {
 		return NewError(CodeInvalidInput, "unsupported incident report request schema version")
 	}
 	if r.Issuer != AgentMonitor {
@@ -129,18 +139,33 @@ func (r IncidentReportRequest) Validate() error {
 			return err
 		}
 	}
-	if (r.GrantID == "") != (r.ReceiptID == "") {
-		return NewError(CodeInvalidInput, "report request grant and receipt IDs must be supplied together")
-	}
-	hasExecutionReference := r.GrantID != ""
+	hasGrantReference := r.GrantID != ""
+	hasReceiptReference := r.ReceiptID != ""
 	switch r.Reason {
-	case ReportReasonDryRunCompleted, ReportReasonActionRejected, ReportReasonActionFailed, ReportReasonVerificationTimedOut:
-		if !hasExecutionReference {
+	case ReportReasonDryRunCompleted, ReportReasonActionRejected,
+		ReportReasonActionFailed, ReportReasonVerificationTimedOut:
+		if !hasGrantReference || !hasReceiptReference {
 			return NewError(CodeInvalidInput, "incident report reason requires an exact action receipt reference")
 		}
-	case ReportReasonDiagnosisInconclusive, ReportReasonPolicyDenied, ReportReasonActionOutcomeUnverified:
-		if hasExecutionReference {
+	case ReportReasonRecoveryVerified:
+		if hasGrantReference != hasReceiptReference {
+			return NewError(CodeInvalidInput, "recovery report action evidence requires both grant and receipt references")
+		}
+	case ReportReasonActionOutcomeUnverified:
+		if !hasGrantReference || hasReceiptReference {
+			return NewError(CodeInvalidInput, "unverified action report requires a grant reference without a receipt claim")
+		}
+	case ReportReasonAuthorityExceeded:
+		if hasReceiptReference && !hasGrantReference {
+			return NewError(CodeInvalidInput, "authority report receipt reference requires its grant reference")
+		}
+	case ReportReasonDiagnosisInconclusive, ReportReasonPolicyDenied:
+		if hasGrantReference || hasReceiptReference {
 			return NewError(CodeInvalidInput, "incident report reason cannot reference an action receipt")
+		}
+	default:
+		if hasGrantReference != hasReceiptReference {
+			return NewError(CodeInvalidInput, "report request grant and receipt IDs must be supplied together")
 		}
 	}
 	for field, value := range map[string]string{
@@ -163,6 +188,12 @@ func (r IncidentReportRequest) Validate() error {
 	}
 	if err := requireTime("report_request.requested_at", r.RequestedAt); err != nil {
 		return err
+	}
+	if err := requireTime("report_request.report_created_at", r.ReportCreatedAt); err != nil {
+		return err
+	}
+	if r.ReportCreatedAt.After(r.RequestedAt) {
+		return NewError(CodeInvalidInput, "incident report creation time cannot follow request authorization time")
 	}
 	if err := requireTime("report_request.expires_at", r.ExpiresAt); err != nil {
 		return err
@@ -194,6 +225,7 @@ func (r IncidentReportRequest) ComputeDigest() (string, error) {
 	if err := r.Validate(); err != nil {
 		return "", err
 	}
+	r.ReportCreatedAt = utc(r.ReportCreatedAt)
 	r.RequestedAt = utc(r.RequestedAt)
 	r.ExpiresAt = utc(r.ExpiresAt)
 	return digestJSON(r)
@@ -203,7 +235,33 @@ func (r IncidentReportRequest) ComputeDigest() (string, error) {
 // request. Both Operator and Monitor use it so an unkeyed report digest cannot
 // be recomputed around an attacker-chosen identifier.
 func (r IncidentReportRequest) DeterministicReportID() (string, error) {
-	digest, err := r.ComputeDigest()
+	if err := r.Validate(); err != nil {
+		return "", err
+	}
+	// Freshness and the signature rotate when Monitor renews delivery after a
+	// lost response. They are authorization-envelope fields, not the logical
+	// terminal report identity. RequestID is stable across those renewals.
+	digest, err := digestJSON(struct {
+		SchemaVersion     string               `json:"schema_version"`
+		RequestID         string               `json:"request_id"`
+		Issuer            AgentID              `json:"issuer"`
+		Audience          AgentID              `json:"audience"`
+		IncidentID        string               `json:"incident_id"`
+		CorrelationID     string               `json:"correlation_id"`
+		DiagnosisReportID string               `json:"diagnosis_report_id"`
+		GrantID           string               `json:"grant_id,omitempty"`
+		ReceiptID         string               `json:"receipt_id,omitempty"`
+		Target            ResourceTarget       `json:"target"`
+		FinalState        IncidentState        `json:"final_state"`
+		Reason            IncidentReportReason `json:"reason"`
+		ReportCreatedAt   time.Time            `json:"report_created_at"`
+	}{
+		SchemaVersion: r.SchemaVersion, RequestID: r.RequestID,
+		Issuer: r.Issuer, Audience: r.Audience, IncidentID: r.IncidentID,
+		CorrelationID: r.CorrelationID, DiagnosisReportID: r.DiagnosisReportID,
+		GrantID: r.GrantID, ReceiptID: r.ReceiptID, Target: r.Target,
+		FinalState: r.FinalState, Reason: r.Reason, ReportCreatedAt: utc(r.ReportCreatedAt),
+	})
 	if err != nil {
 		return "", err
 	}
@@ -418,12 +476,13 @@ func (d NotificationDelivery) Validate() error {
 type NotificationStatus string
 
 const (
+	NotificationQueued    NotificationStatus = "queued"
 	NotificationDelivered NotificationStatus = "delivered"
 	NotificationFailed    NotificationStatus = "failed"
 )
 
 func (s NotificationStatus) Valid() bool {
-	return s == NotificationDelivered || s == NotificationFailed
+	return s == NotificationQueued || s == NotificationDelivered || s == NotificationFailed
 }
 
 // NotificationReceipt is deliberately separate from IncidentReport so a
@@ -453,6 +512,10 @@ func (r NotificationReceipt) Validate() error {
 		return err
 	}
 	switch r.Status {
+	case NotificationQueued:
+		if r.ProviderMessageID != "" || r.ErrorCode != "" || r.ErrorMessage != "" {
+			return NewError(CodeInvalidInput, "queued notification must not contain provider or error details")
+		}
 	case NotificationDelivered:
 		if err := requireSafeReportText("notification.provider_message_id", r.ProviderMessageID); err != nil {
 			return err

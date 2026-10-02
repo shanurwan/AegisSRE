@@ -8,7 +8,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["list"]
+    verbs: ["get", "list"]
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
@@ -17,6 +17,11 @@ rules:
     verbs: ["list"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
+    verbs: ["get"]
+  # Pod log authorization follows the live controller UID chain. ReplicaSet
+  # names are rollout-generated, so they cannot use Deployment resourceNames.
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -34,7 +39,9 @@ subjects:
 # The action MCP adapter can inspect one Deployment and perform only the two
 # implemented Deployment merge-patch shapes (restart or bounded scale). It
 # cannot list, watch, create, delete, exec, read Secrets, or access
-# cluster-scoped resources.
+# cluster-scoped resources. The base is deliberately bound to a nonexistent
+# sentinel; every usable cluster overlay must replace it with one reviewed
+# Deployment name.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -42,6 +49,7 @@ metadata:
 rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
+    resourceNames: ["replace-before-live"]
     verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

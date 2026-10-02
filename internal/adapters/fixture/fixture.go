@@ -1,6 +1,7 @@
 package fixture
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,7 @@ type Backend struct {
 	IDs            ports.IDGenerator
 	AllowMutations bool
 	receipts       map[string]model.ActionReceipt
+	receiptGrants  map[string]model.DelegationGrant
 	applied        map[string]bool
 }
 
@@ -52,7 +54,10 @@ func Load(path string) (*Backend, error) {
 	if err := data.Snapshot.Target.Validate(); err != nil {
 		return nil, fmt.Errorf("fixture target: %w", err)
 	}
-	return &Backend{data: data, receipts: make(map[string]model.ActionReceipt), applied: make(map[string]bool)}, nil
+	return &Backend{
+		data: data, receipts: make(map[string]model.ActionReceipt),
+		receiptGrants: make(map[string]model.DelegationGrant), applied: make(map[string]bool),
+	}, nil
 }
 
 func (b *Backend) QueryMetrics(_ context.Context, input toolapi.QueryMetricsInput) (toolapi.QueryMetricsOutput, error) {
@@ -208,6 +213,23 @@ func (b *Backend) GetPodLogs(_ context.Context, input toolapi.GetPodLogsInput) (
 	return toolapi.GetPodLogsOutput{Pod: input.Pod, Container: input.Container, Logs: logs, Truncated: truncated}, nil
 }
 
+// ResolvePodDeployment gives the policy-enforcing read adapter the fixture's
+// explicit pod-to-workload relationship. Production uses Kubernetes owner
+// references; fixture snapshots intentionally model a single Deployment.
+func (b *Backend) ResolvePodDeployment(_ context.Context, namespace, podName string) (model.ResourceTarget, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if namespace != b.data.Snapshot.Target.Namespace {
+		return model.ResourceTarget{}, model.NewError(model.CodeOutOfScope, "fixture pod namespace is not allowed")
+	}
+	for _, pod := range b.data.Snapshot.Pods {
+		if pod.Name == podName {
+			return b.data.Snapshot.Target, nil
+		}
+	}
+	return model.ResourceTarget{}, model.NewError(model.CodeOutOfScope, "fixture pod is outside the workload snapshot")
+}
+
 func (b *Backend) ExecuteRemediation(_ context.Context, input toolapi.ExecuteRemediationInput) (toolapi.ExecuteRemediationOutput, error) {
 	if b.Verifier == nil || b.Policy == nil || b.Replay == nil || b.Clock == nil || b.IDs == nil {
 		return toolapi.ExecuteRemediationOutput{}, errors.New("fixture action security dependencies are incomplete")
@@ -229,7 +251,11 @@ func (b *Backend) ExecuteRemediation(_ context.Context, input toolapi.ExecuteRem
 	}
 	b.mu.Lock()
 	if receipt, ok := b.receipts[grant.GrantID]; ok {
+		storedGrant, exact := b.receiptGrants[grant.GrantID]
 		b.mu.Unlock()
+		if !exact || !sameFixtureGrant(storedGrant, grant) {
+			return toolapi.ExecuteRemediationOutput{}, model.NewError(model.CodeInvalidInput, "grant ID was reused with different signed contents")
+		}
 		return toolapi.ExecuteRemediationOutput{Receipt: receipt}, nil
 	}
 	b.mu.Unlock()
@@ -292,8 +318,52 @@ func (b *Backend) ExecuteRemediation(_ context.Context, input toolapi.ExecuteRem
 	if err := receipt.Validate(); err != nil {
 		return toolapi.ExecuteRemediationOutput{}, err
 	}
+	if b.receipts == nil {
+		b.receipts = make(map[string]model.ActionReceipt)
+	}
+	if b.receiptGrants == nil {
+		b.receiptGrants = make(map[string]model.DelegationGrant)
+	}
 	b.receipts[grant.GrantID] = receipt
+	b.receiptGrants[grant.GrantID] = grant
 	return toolapi.ExecuteRemediationOutput{Receipt: receipt}, nil
+}
+
+// GetRemediationResult performs an exact, read-only lookup of a previously
+// completed fixture execution. It does not invoke the verifier or policy, so
+// an accepted result remains recoverable after expiry without extending the
+// grant's authority.
+func (b *Backend) GetRemediationResult(
+	_ context.Context,
+	input toolapi.GetRemediationResultInput,
+) (toolapi.GetRemediationResultOutput, error) {
+	if err := input.Grant.ValidateSigned(); err != nil {
+		return toolapi.GetRemediationResultOutput{}, err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	receipt, found := b.receipts[input.Grant.GrantID]
+	if !found {
+		return toolapi.GetRemediationResultOutput{State: toolapi.RemediationNotFound}, nil
+	}
+	storedGrant, exact := b.receiptGrants[input.Grant.GrantID]
+	if !exact || !sameFixtureGrant(storedGrant, input.Grant) {
+		return toolapi.GetRemediationResultOutput{}, model.NewError(model.CodeInvalidInput, "grant ID was reused with different signed contents")
+	}
+	copy := receipt
+	if receipt.Action.Parameters.Replicas != nil {
+		value := *receipt.Action.Parameters.Replicas
+		copy.Action.Parameters.Replicas = &value
+	}
+	if receipt.Before != nil {
+		value := *receipt.Before
+		copy.Before = &value
+	}
+	if receipt.After != nil {
+		value := *receipt.After
+		copy.After = &value
+	}
+	return toolapi.GetRemediationResultOutput{State: toolapi.RemediationCompleted, Receipt: &copy}, nil
 }
 
 func (b *Backend) GetRemediationStatus(_ context.Context, input toolapi.GetRemediationStatusInput) (toolapi.GetRemediationStatusOutput, error) {
@@ -339,4 +409,10 @@ func fixtureResourceSnapshot(value toolapi.WorkloadSnapshot) model.ResourceSnaps
 		ResourceVersion: value.ResourceVersion, DesiredReplicas: value.DesiredReplicas,
 		ReadyReplicas: value.ReadyReplicas, AvailableReplicas: value.AvailableReplicas,
 	}
+}
+
+func sameFixtureGrant(left, right model.DelegationGrant) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
 }

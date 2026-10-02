@@ -4,6 +4,7 @@
 package httpclient
 
 import (
+	"crypto/tls"
 	"errors"
 	"net/http"
 	"time"
@@ -12,6 +13,15 @@ import (
 func Direct(timeout time.Duration) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
+	return &http.Client{Timeout: timeout, Transport: transport, CheckRedirect: rejectRedirect}
+}
+
+func DirectTLS(timeout time.Duration, config *tls.Config) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	if config != nil {
+		transport.TLSClientConfig = config.Clone()
+	}
 	return &http.Client{Timeout: timeout, Transport: transport, CheckRedirect: rejectRedirect}
 }
 

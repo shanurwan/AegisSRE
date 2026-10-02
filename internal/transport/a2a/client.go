@@ -17,14 +17,25 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2aclient/agentcard"
 	"github.com/shanurwan/AegisSRE/internal/core/model"
 	"github.com/shanurwan/AegisSRE/internal/platform/httpclient"
+	"github.com/shanurwan/AegisSRE/internal/platform/observability"
 )
 
 type Client struct {
-	HTTPClient *http.Client
+	HTTPClient      *http.Client
+	PeerHTTPClients map[model.AgentID]*http.Client
+	RequireMTLS     bool
 }
 
 func NewClient(timeout time.Duration) *Client {
-	return &Client{HTTPClient: httpclient.Direct(timeout)}
+	return &Client{HTTPClient: observability.HTTPClient(httpclient.Direct(timeout))}
+}
+
+func NewAuthenticatedClient(peers map[model.AgentID]*http.Client) *Client {
+	copy := make(map[model.AgentID]*http.Client, len(peers))
+	for role, client := range peers {
+		copy[role] = client
+	}
+	return &Client{PeerHTTPClients: copy, RequireMTLS: true}
 }
 
 func (c *Client) Send(ctx context.Context, endpoint string, envelope model.Envelope, response any) error {
@@ -35,15 +46,21 @@ func (c *Client) Send(ctx context.Context, endpoint string, envelope model.Envel
 		return errors.New("A2A response destination is required")
 	}
 	httpClient := c.HTTPClient
+	if c.RequireMTLS {
+		httpClient = c.PeerHTTPClients[envelope.Recipient]
+		if httpClient == nil {
+			return model.NewError(model.CodeOutOfScope, "no authenticated A2A route exists for the requested recipient")
+		}
+	}
 	if httpClient == nil {
-		httpClient = httpclient.Direct(30 * time.Second)
+		httpClient = observability.HTTPClient(httpclient.Direct(30 * time.Second))
 	}
 	resolver := agentcard.NewResolver(httpClient)
 	card, err := resolver.Resolve(ctx, endpoint)
 	if err != nil {
 		return fmt.Errorf("resolve A2A agent card: %w", err)
 	}
-	if err := constrainCard(endpoint, card); err != nil {
+	if err := constrainCard(endpoint, card, c.RequireMTLS); err != nil {
 		return err
 	}
 	client, err := a2aclient.NewFromCard(ctx, card,
@@ -88,6 +105,7 @@ func knownPeerErrorCode(code model.ErrorCode) bool {
 	case model.CodeInvalidInput, model.CodeInvalidStateTransition, model.CodeOutOfScope,
 		model.CodeDelegationRequired, model.CodePolicyDenied, model.CodeInvalidSignature,
 		model.CodeGrantNotYetValid, model.CodeGrantExpired, model.CodeReplayedGrant,
+		model.CodeExecutionPending,
 		model.CodeStalePrecondition, model.CodeToolBudgetExceeded,
 		model.CodeInconclusiveDiagnosis, model.CodeExecutionFailed:
 		return true
@@ -96,13 +114,16 @@ func knownPeerErrorCode(code model.ErrorCode) bool {
 	}
 }
 
-func constrainCard(endpoint string, card *a2a.AgentCard) error {
+func constrainCard(endpoint string, card *a2a.AgentCard, requireMTLS ...bool) error {
 	base, err := url.Parse(endpoint)
 	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil {
 		return model.NewError(model.CodeInvalidInput, "configured A2A endpoint is invalid")
 	}
 	if card == nil || len(card.SupportedInterfaces) == 0 {
 		return model.NewError(model.CodeInvalidInput, "peer Agent Card has no interfaces")
+	}
+	if len(requireMTLS) > 0 && requireMTLS[0] && !cardRequiresMTLS(card) {
+		return model.NewError(model.CodeDelegationRequired, "peer Agent Card does not require mutual TLS")
 	}
 	found := false
 	for _, iface := range card.SupportedInterfaces {
@@ -119,6 +140,26 @@ func constrainCard(endpoint string, card *a2a.AgentCard) error {
 		return nil
 	}
 	return model.NewError(model.CodeInvalidInput, "peer Agent Card does not expose JSON-RPC")
+}
+
+func cardRequiresMTLS(card *a2a.AgentCard) bool {
+	if card == nil {
+		return false
+	}
+	const schemeName a2a.SecuritySchemeName = "mtls"
+	scheme, ok := card.SecuritySchemes[schemeName]
+	if !ok {
+		return false
+	}
+	if _, ok := scheme.(a2a.MutualTLSSecurityScheme); !ok {
+		return false
+	}
+	for _, requirement := range card.SecurityRequirements {
+		if _, required := requirement[schemeName]; required {
+			return true
+		}
+	}
+	return false
 }
 
 func sameOrigin(left, right *url.URL) bool {

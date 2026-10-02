@@ -21,6 +21,7 @@ func TestIncidentReportRequestIsSanitizedAndStateBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	request.RequestedAt = now.In(time.FixedZone("MYT", 8*60*60))
+	request.ReportCreatedAt = request.ReportCreatedAt.In(time.FixedZone("MYT", 8*60*60))
 	second, err := request.ComputeDigest()
 	if err != nil {
 		t.Fatal(err)
@@ -138,6 +139,7 @@ func TestUnverifiableActionOutcomeUsesDistinctReceiptFreeEscalation(t *testing.T
 	request := validIncidentReportRequest(now)
 	request.FinalState = IncidentEscalated
 	request.Reason = ReportReasonActionOutcomeUnverified
+	request.GrantID = "grant-ambiguous"
 	if err := request.Validate(); err != nil {
 		t.Fatalf("receipt-free unverified-outcome request rejected: %v", err)
 	}
@@ -199,7 +201,7 @@ func TestIncidentReportReasonStateMatrixIsClosed(t *testing.T) {
 
 func validIncidentReportRequest(now time.Time) IncidentReportRequest {
 	return IncidentReportRequest{
-		SchemaVersion: SchemaVersionV1, RequestID: "report-request-1",
+		SchemaVersion: IncidentReportRequestSchemaVersionV2, RequestID: "report-request-1",
 		Issuer: AgentMonitor, Audience: AgentOperator,
 		IncidentID: "incident-1", CorrelationID: "correlation-1",
 		DiagnosisReportID: "diagnosis-1",
@@ -208,6 +210,6 @@ func validIncidentReportRequest(now time.Time) IncidentReportRequest {
 			Namespace: "outage-arena", Name: "demo-api",
 		},
 		FinalState: IncidentResolved, Reason: ReportReasonRecoveryVerified,
-		RequestedAt: now, ExpiresAt: now.Add(2 * time.Minute),
+		ReportCreatedAt: now, RequestedAt: now, ExpiresAt: now.Add(2 * time.Minute),
 	}
 }

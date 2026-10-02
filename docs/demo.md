@@ -13,7 +13,7 @@ Monitor -> terminal report request -> Operator -> notification receipt
 
 It demonstrates process composition, bounded tools, structured agent messages, grant validation, dry-run behavior, and audit correlation. The repository integration test exercises the same fixture path in-process across real MCP and A2A HTTP transports.
 
-It does **not** prove Kubernetes RBAC, NetworkPolicy enforcement, production identity/TLS, distributed replay/outbox protection, live Victoria schemas, Meta credentials/template approval or egress, safe workload-specific remediation, or protocol conformance.
+It does **not** exercise Kubernetes RBAC, NetworkPolicy enforcement, the production mTLS/keyring/policy mounts, PostgreSQL leadership/execution/outbox state, OTLP export, live Victoria schemas, Meta credentials/template approval or egress, safe workload-specific remediation, or protocol conformance. Those paths exist outside this intentionally dependency-free fixture topology and require their own integration or live acceptance evidence.
 
 ## Safe defaults
 
@@ -215,6 +215,7 @@ The action server exposes:
 
 ```text
 k8s_execute_remediation
+k8s_get_remediation_result
 k8s_get_remediation_status
 ```
 
@@ -240,10 +241,12 @@ The default-safe dry-run integration check is:
 go test ./internal/integration -run TestFixtureIncidentFlowsAcrossMCPAndA2A
 ```
 
-The dedicated deterministic control-plane E2E gate crosses real MCP, A2A, and notification HTTP boundaries. It proves a signed live fixture remediation followed by independent recovery verification and WhatsApp delivery, plus an outside-authority escalation that performs zero action calls:
+The dedicated deterministic control-plane E2E gate crosses real MCP, A2A, and notification HTTP boundaries. It proves a signed live fixture remediation followed by independent recovery verification and WhatsApp delivery, an outside-authority escalation that performs zero action calls, and exact read-MCP policy rejection/filtering over real MCP HTTP:
 
 ```bash
 make test-e2e
 ```
 
 Passing these tests does not validate separate-process Docker networking, a deployed cluster, live Victoria schemas, Kubernetes RBAC/NetworkPolicy enforcement, or production workload identity.
+
+For production-shaped render validation use `make manifest-policy-overlays`. For the guarded live-k3s canary contract use `make live-k3s-acceptance-help`; do not treat that runner's presence as evidence it has been executed.

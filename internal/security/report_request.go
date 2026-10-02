@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	reportRequestSignatureDomain  = "AegisSRE/incident-report-request/v1\x00"
+	reportRequestSignatureDomain  = "AegisSRE/incident-report-request/v2\x00"
 	maxCanonicalReportRequestSize = 64 << 10
 )
 
@@ -36,6 +36,7 @@ func CanonicalReportRequestBytes(request model.IncidentReportRequest) ([]byte, e
 }
 
 func normalizeReportRequest(request model.IncidentReportRequest) model.IncidentReportRequest {
+	request.ReportCreatedAt = request.ReportCreatedAt.UTC()
 	request.RequestedAt = request.RequestedAt.UTC()
 	request.ExpiresAt = request.ExpiresAt.UTC()
 	return request

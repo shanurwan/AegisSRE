@@ -4,6 +4,8 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,6 +13,22 @@ import (
 
 	"github.com/shanurwan/AegisSRE/internal/core/model"
 )
+
+func TestLoadPrivateKeyFile(t *testing.T) {
+	t.Parallel()
+	_, privateKey := signingKeys(t)
+	path := filepath.Join(t.TempDir(), "private-key")
+	if err := os.WriteFile(path, []byte(EncodePrivateKeyBase64(privateKey)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadPrivateKeyFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(loaded) != string(privateKey) {
+		t.Fatal("loaded private key differs from file")
+	}
+}
 
 func testGrant(now time.Time) model.DelegationGrant {
 	replicas := int32(2)

@@ -4,15 +4,315 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/shanurwan/AegisSRE/internal/core/model"
+	"github.com/shanurwan/AegisSRE/internal/core/ports"
 	"github.com/shanurwan/AegisSRE/internal/security"
 	"github.com/shanurwan/AegisSRE/internal/toolapi"
 )
+
+func TestDurableMonitorLeaseAllowsOnlyOneReplicaToScan(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 10, 2, 1, 0, 0, 0, time.UTC)
+	state := &monitorStateFake{}
+	firstTools := &monitorToolFake{now: now}
+	first := monitorService(now, firstTools, &monitorPeerFake{now: now, diagnosisStatus: model.DiagnosisInconclusive})
+	first.StateStore, first.InstanceID, first.StateLease = state, "monitor-a", time.Minute
+	if _, err := first.Scan(context.Background(), ScanRequest{}); err != nil {
+		t.Fatal(err)
+	}
+
+	secondTools := &monitorToolFake{now: now}
+	secondPeers := &monitorPeerFake{now: now, diagnosisStatus: model.DiagnosisInconclusive}
+	second := monitorService(now, secondTools, secondPeers)
+	second.StateStore, second.InstanceID, second.StateLease = state, "monitor-b", time.Minute
+	result, err := second.Scan(context.Background(), ScanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Candidates != 0 || len(result.Outcomes) != 0 || len(secondTools.calls) != 0 || len(secondPeers.endpoints) != 0 {
+		t.Fatalf("standby Monitor performed work: result=%#v tools=%v peers=%v", result, secondTools.calls, secondPeers.endpoints)
+	}
+}
+
+func TestDurableMonitorRestartResumesVerificationWithoutRedelegation(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 10, 2, 1, 10, 0, 0, time.UTC)
+	state := &monitorStateFake{}
+	tools := &monitorToolFake{now: now}
+	peers := &monitorPeerFake{now: now, diagnosisStatus: model.DiagnosisConfirmed, remediationOutcome: model.ActionSucceeded}
+	first := durableActionMonitor(t, now, tools, peers, state, "monitor-a")
+	result, err := first.Scan(context.Background(), ScanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Outcomes) != 1 || result.Outcomes[0].Status != "verification_pending" || peers.remediationCalls != 1 {
+		t.Fatalf("initial durable action = %#v, remediation calls=%d", result.Outcomes, peers.remediationCalls)
+	}
+
+	state.expire()
+	tools.healthySnapshot = true
+	second := durableActionMonitor(t, now, tools, peers, state, "monitor-b")
+	result, err = second.Scan(context.Background(), ScanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Outcomes) != 1 || result.Outcomes[0].Status != "resolved" {
+		t.Fatalf("restarted Monitor did not resume verification: %#v", result.Outcomes)
+	}
+	if peers.remediationCalls != 1 {
+		t.Fatalf("restart repeated remediation %d times", peers.remediationCalls)
+	}
+	if len(peers.reportRequests) != 1 || result.Outcomes[0].Report == nil {
+		t.Fatalf("restarted Monitor did not complete durable reporting: %#v", result.Outcomes[0])
+	}
+}
+
+func TestDurableMonitorRetriesExactGrantAfterAmbiguousDelivery(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 10, 2, 1, 20, 0, 0, time.UTC)
+	state := &monitorStateFake{}
+	tools := &monitorToolFake{now: now}
+	peers := &monitorPeerFake{
+		now: now, diagnosisStatus: model.DiagnosisConfirmed,
+		remediationOutcome: model.ActionSucceeded,
+		remediationErr: model.WrapError(
+			model.CodeExecutionPending,
+			"durable action outcome reconciliation is pending",
+			errors.New("ambiguous transport failure"),
+		),
+	}
+	first := durableActionMonitor(t, now, tools, peers, state, "monitor-a")
+	result, err := first.Scan(context.Background(), ScanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Outcomes) != 1 || result.Outcomes[0].Status != "remediation_delivery_pending" {
+		t.Fatalf("ambiguous delivery was not retained: %#v", result.Outcomes)
+	}
+	if len(peers.reportRequests) != 0 {
+		t.Fatalf("retryable execution-pending response switched to terminal reporting: %#v", peers.reportRequests)
+	}
+
+	state.expire()
+	peers.remediationErr = nil
+	second := durableActionMonitor(t, now, tools, peers, state, "monitor-b")
+	result, err = second.Scan(context.Background(), ScanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Outcomes) != 1 || result.Outcomes[0].Status != "verification_pending" {
+		t.Fatalf("exact dispatch did not resume: %#v", result.Outcomes)
+	}
+	if len(peers.remediationGrantIDs) != 2 || peers.remediationGrantIDs[0] != peers.remediationGrantIDs[1] {
+		t.Fatalf("restart issued a different grant: %v", peers.remediationGrantIDs)
+	}
+	investigations := 0
+	for _, kind := range peers.kinds {
+		if kind == model.MessageInvestigationRequest {
+			investigations++
+		}
+	}
+	if investigations != 1 {
+		t.Fatalf("restart repeated investigation instead of resuming exact dispatch: %d", investigations)
+	}
+}
+
+func TestDurableMonitorRestartRetriesExactSignedReport(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 10, 2, 1, 30, 0, 0, time.UTC)
+	state := &monitorStateFake{}
+	tools := &monitorToolFake{now: now, healthyAfterSnapshot: 2}
+	peers := &monitorPeerFake{
+		now: now, diagnosisStatus: model.DiagnosisConfirmed,
+		remediationOutcome: model.ActionSucceeded, reportErr: errors.New("ambiguous report transport failure"),
+	}
+	first := durableActionMonitor(t, now, tools, peers, state, "monitor-a")
+	result, err := first.Scan(context.Background(), ScanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Outcomes) != 1 || result.Outcomes[0].Status != "resolved" || len(peers.reportRequestAttempts) != 1 {
+		t.Fatalf("initial report attempt was not checkpointed: outcomes=%#v attempts=%d", result.Outcomes, len(peers.reportRequestAttempts))
+	}
+
+	state.expire()
+	peers.reportErr = nil
+	second := durableActionMonitor(t, now, tools, peers, state, "monitor-b")
+	result, err = second.Scan(context.Background(), ScanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Outcomes) != 1 || result.Outcomes[0].Report == nil || peers.remediationCalls != 1 {
+		t.Fatalf("restarted Monitor did not finish report-only recovery: outcomes=%#v actions=%d", result.Outcomes, peers.remediationCalls)
+	}
+	if len(peers.reportRequestAttempts) != 2 || !sameJSON(peers.reportRequestAttempts[0], peers.reportRequestAttempts[1]) {
+		t.Fatalf("restart did not retry the exact signed report request: %#v", peers.reportRequestAttempts)
+	}
+}
+
+func TestDurableMonitorResignsReportAfterDefinitiveExpiry(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 10, 2, 1, 40, 0, 0, time.UTC)
+	state := &monitorStateFake{}
+	tools := &monitorToolFake{now: now, healthyAfterSnapshot: 2}
+	peers := &monitorPeerFake{
+		now: now, diagnosisStatus: model.DiagnosisConfirmed,
+		remediationOutcome: model.ActionSucceeded, reportErr: errors.New("Operator unavailable"),
+	}
+	first := durableActionMonitor(t, now, tools, peers, state, "monitor-a")
+	if _, err := first.Scan(context.Background(), ScanRequest{}); err != nil {
+		t.Fatal(err)
+	}
+
+	later := now.Add(model.MaxIncidentReportRequestTTL + time.Minute)
+	state.expire()
+	tools.now = later
+	peers.now = later
+	peers.reportErr = nil
+	second := durableActionMonitor(t, later, tools, peers, state, "monitor-b")
+	result, err := second.Scan(context.Background(), ScanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Outcomes) != 1 || result.Outcomes[0].Report == nil || peers.remediationCalls != 1 {
+		t.Fatalf("expired report recovery failed: outcomes=%#v actions=%d", result.Outcomes, peers.remediationCalls)
+	}
+	if len(peers.reportRequestAttempts) != 3 {
+		t.Fatalf("report attempts = %d, want initial, definitive expiry, and renewed request", len(peers.reportRequestAttempts))
+	}
+	initial, expiredRetry, renewed := peers.reportRequestAttempts[0], peers.reportRequestAttempts[1], peers.reportRequestAttempts[2]
+	if !sameJSON(initial, expiredRetry) {
+		t.Fatal("Monitor did not first query Operator with the exact checkpointed report request")
+	}
+	if renewed.RequestID != initial.RequestID || !renewed.ReportCreatedAt.Equal(initial.ReportCreatedAt) ||
+		!renewed.RequestedAt.Equal(later) || !later.Before(renewed.ExpiresAt) {
+		t.Fatalf("renewed report request identity/window is invalid: %#v", renewed)
+	}
+	initialReportID, err := initial.DeterministicReportID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	renewedReportID, err := renewed.DeterministicReportID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initialReportID != renewedReportID {
+		t.Fatalf("renewal changed logical report ID: initial=%q renewed=%q", initialReportID, renewedReportID)
+	}
+}
+
+func TestDurableMonitorRenewsExpiredReportAfterSigningKeyRetirement(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 10, 2, 1, 45, 0, 0, time.UTC)
+	state := &monitorStateFake{}
+	tools := &monitorToolFake{now: now, healthyAfterSnapshot: 2}
+	peers := &monitorPeerFake{
+		now: now, diagnosisStatus: model.DiagnosisConfirmed,
+		remediationOutcome: model.ActionSucceeded,
+		rejectReportKeyID:  "durable-monitor-test-key",
+	}
+	first := durableActionMonitor(t, now, tools, peers, state, "monitor-old-key")
+	firstResult, err := first.Scan(context.Background(), ScanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(firstResult.Outcomes) != 1 || firstResult.Outcomes[0].Report != nil ||
+		len(peers.reportRequestAttempts) != 1 || peers.remediationCalls != 1 {
+		t.Fatalf("old-key report was not durably retained: outcomes=%#v attempts=%d actions=%d", firstResult.Outcomes, len(peers.reportRequestAttempts), peers.remediationCalls)
+	}
+	original := peers.reportRequestAttempts[0]
+
+	later := now.Add(model.MaxIncidentReportRequestTTL + time.Minute)
+	state.expire()
+	tools.now = later
+	peers.now = later
+	rotated := durableActionMonitor(t, later, tools, peers, state, "monitor-new-key")
+	newPrivateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{99}, ed25519.SeedSize))
+	newSigner, err := security.NewSigner(newPrivateKey, "rotated-monitor-report-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated.ReportSigner = newSigner
+
+	result, err := rotated.Scan(context.Background(), ScanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Outcomes) != 1 || result.Outcomes[0].Report == nil || peers.remediationCalls != 1 {
+		t.Fatalf("rotated-key report-only recovery failed: outcomes=%#v actions=%d", result.Outcomes, peers.remediationCalls)
+	}
+	if len(peers.reportRequestAttempts) != 3 {
+		t.Fatalf("report attempts = %d, want initial old key, expired old key, renewed key", len(peers.reportRequestAttempts))
+	}
+	retriedOld, renewed := peers.reportRequestAttempts[1], peers.reportRequestAttempts[2]
+	if retriedOld.Signature.KeyID != original.Signature.KeyID ||
+		renewed.Signature.KeyID != "rotated-monitor-report-key" {
+		t.Fatalf("report key lineage = %q -> %q -> %q", original.Signature.KeyID, retriedOld.Signature.KeyID, renewed.Signature.KeyID)
+	}
+	if renewed.RequestID != original.RequestID || !renewed.ReportCreatedAt.Equal(original.ReportCreatedAt) ||
+		renewed.IncidentID != original.IncidentID || renewed.Reason != original.Reason ||
+		!renewed.Target.Equal(original.Target) {
+		t.Fatalf("key rotation changed immutable report semantics: original=%#v renewed=%#v", original, renewed)
+	}
+	originalID, err := original.DeterministicReportID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	renewedID, err := renewed.DeterministicReportID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renewedID != originalID || result.Outcomes[0].Report.Report.ReportID != originalID {
+		t.Fatalf("key rotation changed report identity: original=%q renewed=%q result=%q", originalID, renewedID, result.Outcomes[0].Report.Report.ReportID)
+	}
+}
+
+func TestDurableMonitorRetriesExpiredReportSignaturesWithoutAbandonment(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 10, 2, 1, 50, 0, 0, time.UTC)
+	state := &monitorStateFake{}
+	tools := &monitorToolFake{now: now, healthyAfterSnapshot: 2}
+	peers := &monitorPeerFake{
+		now: now, diagnosisStatus: model.DiagnosisConfirmed,
+		remediationOutcome: model.ActionSucceeded, reportErr: errors.New("Operator unavailable"),
+	}
+	service := durableActionMonitor(t, now, tools, peers, state, "monitor-1")
+	if _, err := service.Scan(context.Background(), ScanRequest{}); err != nil {
+		t.Fatal(err)
+	}
+
+	var result ScanResult
+	const renewalCount = 5
+	for attempt := 2; attempt <= renewalCount+1; attempt++ {
+		now = now.Add(model.MaxIncidentReportRequestTTL + time.Minute)
+		state.expire()
+		tools.now = now
+		peers.now = now
+		service = durableActionMonitor(t, now, tools, peers, state, fmt.Sprintf("monitor-%d", attempt))
+		var err error
+		result, err = service.Scan(context.Background(), ScanRequest{})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(result.Outcomes) != 1 || result.Outcomes[0].Status != "report_delivery_pending" {
+		t.Fatalf("durably retried report workflow = %#v", result.Outcomes)
+	}
+	unique := make(map[string]struct{})
+	for _, request := range peers.reportRequestAttempts {
+		unique[request.RequestID] = struct{}{}
+	}
+	if len(unique) != 1 || peers.remediationCalls != 1 {
+		t.Fatalf("signed report identities=%d actions=%d, want one stable identity and one action", len(unique), peers.remediationCalls)
+	}
+}
 
 func TestScanDoesNotDelegateBeforeVerificationThreshold(t *testing.T) {
 	t.Parallel()
@@ -411,6 +711,14 @@ func TestPostGrantUnverifiedOutcomesProduceSignedEscalationReport(t *testing.T) 
 		{name: "expired grant", remediationErr: model.NewError(model.CodeGrantExpired, "grant expired at Operator")},
 		{name: "replayed grant", remediationErr: model.NewError(model.CodeReplayedGrant, "grant replay was not recoverable")},
 		{name: "execution error", remediationErr: model.NewError(model.CodeExecutionFailed, "action backend returned no receipt")},
+		{
+			name: "uncertain recovery after policy denial",
+			remediationErr: model.WrapError(
+				model.CodeExecutionFailed,
+				"delegated execution outcome is uncertain and requires reconciliation",
+				model.NewError(model.CodePolicyDenied, "current policy no longer authorizes a retry"),
+			),
+		},
 		{name: "transport failure", remediationErr: fmt.Errorf("operator connection reset")},
 		{name: "mismatched receipt", mismatchedReceipt: true},
 	}
@@ -452,8 +760,8 @@ func TestPostGrantUnverifiedOutcomesProduceSignedEscalationReport(t *testing.T) 
 				t.Fatalf("Operator calls = remediation %d, reports %d; want one each", peers.remediationCalls, len(peers.reportRequests))
 			}
 			request := peers.reportRequests[0]
-			if request.GrantID != "" || request.ReceiptID != "" {
-				t.Fatalf("failure report trusted an absent or malformed receipt: %#v", request)
+			if request.GrantID != outcome.Grant.GrantID || request.ReceiptID != "" {
+				t.Fatalf("failure report did not carry the exact grant-only ambiguity reference: %#v", request)
 			}
 		})
 	}
@@ -615,15 +923,43 @@ func monitorService(now time.Time, tools *monitorToolFake, peers *monitorPeerFak
 	}
 }
 
+func durableActionMonitor(
+	t *testing.T,
+	now time.Time,
+	tools *monitorToolFake,
+	peers *monitorPeerFake,
+	state ports.MonitorStateStore,
+	instanceID string,
+) *Service {
+	t.Helper()
+	privateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{52}, ed25519.SeedSize))
+	signer, err := security.NewSigner(privateKey, "durable-monitor-test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := monitorService(now, tools, peers)
+	service.Signer = signer
+	service.ReportSigner = signer
+	service.Policy = allowProposalPolicy{}
+	service.DryRun = false
+	service.VerificationCount = 1
+	service.StateStore = state
+	service.InstanceID = instanceID
+	service.StateLease = time.Minute
+	return service
+}
+
 type monitorToolFake struct {
-	now             time.Time
-	calls           []string
-	samples         []toolapi.MetricSample
-	logSamples      []toolapi.DetectionSample
-	traceSamples    []toolapi.DetectionSample
-	noDefaultMetric bool
-	healthySnapshot bool
-	metricErr       error
+	now                  time.Time
+	calls                []string
+	snapshotCalls        int
+	samples              []toolapi.MetricSample
+	logSamples           []toolapi.DetectionSample
+	traceSamples         []toolapi.DetectionSample
+	noDefaultMetric      bool
+	healthySnapshot      bool
+	healthyAfterSnapshot int
+	metricErr            error
 }
 
 func (*monitorToolFake) Discover(context.Context) ([]string, error) {
@@ -659,6 +995,7 @@ func (f *monitorToolFake) Call(_ context.Context, name string, input, output any
 		}
 		return nil
 	case toolapi.ToolGetWorkloadSnapshot:
+		f.snapshotCalls++
 		request, ok := input.(toolapi.GetWorkloadSnapshotInput)
 		if !ok {
 			return fmt.Errorf("unexpected snapshot input %T", input)
@@ -673,7 +1010,7 @@ func (f *monitorToolFake) Call(_ context.Context, name string, input, output any
 			DesiredReplicas: 1, ReadyReplicas: 0, AvailableReplicas: 0, UnavailableReplicas: 1,
 			ObservedAt: f.now,
 		}
-		if f.healthySnapshot {
+		if f.healthySnapshot || f.healthyAfterSnapshot > 0 && f.snapshotCalls >= f.healthyAfterSnapshot {
 			result.Snapshot.ReadyReplicas = 1
 			result.Snapshot.AvailableReplicas = 1
 			result.Snapshot.UnavailableReplicas = 0
@@ -725,19 +1062,23 @@ func (f *monitorToolFake) count(name string) int {
 }
 
 type monitorPeerFake struct {
-	now                  time.Time
-	diagnosisStatus      model.DiagnosisStatus
-	remediationErr       error
-	remediationOutcome   model.ActionOutcome
-	mismatchedReceipt    bool
-	remediationCalls     int
-	lastReceipt          *model.ActionReceipt
-	reportRequests       []model.IncidentReportRequest
-	forgeReportExecution bool
-	forgeReportID        bool
-	forgeReportCreatedAt bool
-	endpoints            []string
-	kinds                []model.MessageKind
+	now                   time.Time
+	diagnosisStatus       model.DiagnosisStatus
+	remediationErr        error
+	remediationOutcome    model.ActionOutcome
+	mismatchedReceipt     bool
+	remediationCalls      int
+	remediationGrantIDs   []string
+	lastReceipt           *model.ActionReceipt
+	reportRequests        []model.IncidentReportRequest
+	reportRequestAttempts []model.IncidentReportRequest
+	reportErr             error
+	rejectReportKeyID     string
+	forgeReportExecution  bool
+	forgeReportID         bool
+	forgeReportCreatedAt  bool
+	endpoints             []string
+	kinds                 []model.MessageKind
 }
 
 func (f *monitorPeerFake) Send(_ context.Context, endpoint string, envelope model.Envelope, response any) error {
@@ -746,12 +1087,13 @@ func (f *monitorPeerFake) Send(_ context.Context, endpoint string, envelope mode
 	if endpoint == "http://operator" {
 		if envelope.Kind == model.MessageRemediationRequest {
 			f.remediationCalls++
-			if f.remediationErr != nil {
-				return f.remediationErr
-			}
 			var grant model.DelegationGrant
 			if err := envelope.DecodePayload(&grant); err != nil {
 				return err
+			}
+			f.remediationGrantIDs = append(f.remediationGrantIDs, grant.GrantID)
+			if f.remediationErr != nil {
+				return f.remediationErr
 			}
 			grantID := grant.GrantID
 			if f.mismatchedReceipt {
@@ -800,6 +1142,16 @@ func (f *monitorPeerFake) Send(_ context.Context, endpoint string, envelope mode
 		if err := request.ValidateSigned(); err != nil {
 			return fmt.Errorf("Monitor sent an unauthorized report request: %w", err)
 		}
+		f.reportRequestAttempts = append(f.reportRequestAttempts, request)
+		if f.rejectReportKeyID != "" && request.Signature.KeyID == f.rejectReportKeyID {
+			return model.NewError(model.CodeInvalidSignature, "incident report signing key is retired")
+		}
+		if !f.now.Before(request.ExpiresAt) {
+			return model.NewError(model.CodeGrantExpired, "incident report request has expired")
+		}
+		if f.reportErr != nil {
+			return f.reportErr
+		}
 		f.reportRequests = append(f.reportRequests, request)
 		reportID, err := request.DeterministicReportID()
 		if err != nil {
@@ -810,9 +1162,9 @@ func (f *monitorPeerFake) Send(_ context.Context, endpoint string, envelope mode
 			IncidentID: request.IncidentID, CorrelationID: request.CorrelationID,
 			DiagnosisReportID: request.DiagnosisReportID, Target: request.Target,
 			FinalState: request.FinalState, Reason: request.Reason, Summary: request.Reason.Summary(),
-			CreatedAt: request.RequestedAt,
+			CreatedAt: request.ReportCreatedAt,
 		}
-		if request.GrantID != "" && f.lastReceipt != nil {
+		if request.ReceiptID != "" && f.lastReceipt != nil {
 			report.Execution = &model.IncidentReportExecution{
 				GrantID: request.GrantID, ReceiptID: request.ReceiptID, Action: f.lastReceipt.Action,
 				Outcome: f.lastReceipt.Outcome, DryRun: f.lastReceipt.DryRun, CompletedAt: f.lastReceipt.CompletedAt,
@@ -822,7 +1174,7 @@ func (f *monitorPeerFake) Send(_ context.Context, endpoint string, envelope mode
 			report.ReportID = "report-forged"
 		}
 		if f.forgeReportCreatedAt {
-			report.CreatedAt = request.RequestedAt.Add(time.Second)
+			report.CreatedAt = request.ReportCreatedAt.Add(time.Second)
 		}
 		if f.forgeReportExecution {
 			replicas := int32(2)
@@ -915,4 +1267,91 @@ type monitorIDs struct{ next int }
 func (g *monitorIDs) NewID() string {
 	g.next++
 	return fmt.Sprintf("monitor-id-%d", g.next)
+}
+
+type monitorStateFake struct {
+	mu      sync.Mutex
+	lease   ports.MonitorLease
+	payload []byte
+	version int64
+	next    int64
+}
+
+func (s *monitorStateFake) AcquireMonitorLease(
+	_ context.Context,
+	namespace, owner string,
+	duration time.Duration,
+) (ports.MonitorLease, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lease.Owner != "" && s.lease.Owner != owner {
+		return ports.MonitorLease{}, false, nil
+	}
+	s.next++
+	s.lease = ports.MonitorLease{
+		Namespace: namespace, Owner: owner, Token: fmt.Sprintf("lease-%d", s.next),
+		FencingToken: s.next, LeaseUntil: time.Now().Add(duration),
+	}
+	return s.lease, true, nil
+}
+
+func (s *monitorStateFake) RenewMonitorLease(
+	_ context.Context,
+	lease ports.MonitorLease,
+	duration time.Duration,
+) (ports.MonitorLease, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !sameMonitorLease(s.lease, lease) {
+		return ports.MonitorLease{}, errors.New("lease lost")
+	}
+	s.lease.LeaseUntil = time.Now().Add(duration)
+	return s.lease, nil
+}
+
+func (s *monitorStateFake) LoadMonitorCheckpoint(
+	_ context.Context,
+	lease ports.MonitorLease,
+) (ports.MonitorCheckpoint, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !sameMonitorLease(s.lease, lease) {
+		return ports.MonitorCheckpoint{}, false, errors.New("lease lost")
+	}
+	if len(s.payload) == 0 {
+		return ports.MonitorCheckpoint{}, false, nil
+	}
+	return ports.MonitorCheckpoint{
+		Payload: append([]byte(nil), s.payload...), Version: s.version,
+		FencingToken: lease.FencingToken, UpdatedAt: time.Now(),
+	}, true, nil
+}
+
+func (s *monitorStateFake) SaveMonitorCheckpoint(
+	_ context.Context,
+	lease ports.MonitorLease,
+	payload []byte,
+) (ports.MonitorCheckpoint, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !sameMonitorLease(s.lease, lease) {
+		return ports.MonitorCheckpoint{}, errors.New("lease lost")
+	}
+	s.version++
+	s.payload = append(s.payload[:0], payload...)
+	return ports.MonitorCheckpoint{
+		Payload: append([]byte(nil), payload...), Version: s.version,
+		FencingToken: lease.FencingToken, UpdatedAt: time.Now(),
+	}, nil
+}
+
+func (s *monitorStateFake) expire() {
+	s.mu.Lock()
+	s.lease = ports.MonitorLease{}
+	s.mu.Unlock()
+}
+
+func sameMonitorLease(left, right ports.MonitorLease) bool {
+	return left.Namespace == right.Namespace && left.Owner == right.Owner && left.Token == right.Token &&
+		left.FencingToken == right.FencingToken
 }

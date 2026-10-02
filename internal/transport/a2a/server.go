@@ -13,6 +13,7 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/shanurwan/AegisSRE/internal/core/model"
+	"github.com/shanurwan/AegisSRE/internal/transport/authn"
 )
 
 type Handler func(context.Context, model.Envelope) (model.Envelope, error)
@@ -24,10 +25,12 @@ type CardConfig struct {
 	SkillID     string
 	SkillName   string
 	Examples    []string
+	RequireMTLS bool
 }
 
 type executor struct {
-	handle Handler
+	handle      Handler
+	requireMTLS bool
 }
 
 func (e *executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
@@ -47,6 +50,12 @@ func (e *executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 		if err != nil {
 			e.fail(execCtx, err, yield)
 			return
+		}
+		if e.requireMTLS {
+			if err := authn.RequireAgent(ctx, envelope.Sender); err != nil {
+				e.fail(execCtx, err, yield)
+				return
+			}
 		}
 		response, err := e.handle(ctx, envelope)
 		if err != nil {
@@ -122,8 +131,17 @@ func NewHandler(config CardConfig, handle Handler) (http.Handler, *a2a.AgentCard
 			Examples: config.Examples, InputModes: []string{"application/json"}, OutputModes: []string{"application/json"},
 		}},
 	}
+	if config.RequireMTLS {
+		const schemeName a2a.SecuritySchemeName = "mtls"
+		card.SecuritySchemes = a2a.NamedSecuritySchemes{
+			schemeName: a2a.MutualTLSSecurityScheme{Description: "AegisSRE workload-bound mutual TLS"},
+		}
+		card.SecurityRequirements = a2a.SecurityRequirementsOptions{
+			a2a.SecurityRequirements{schemeName: a2a.SecuritySchemeScopes{}},
+		}
+	}
 	requestHandler := a2asrv.NewHandler(
-		&executor{handle: handle},
+		&executor{handle: handle, requireMTLS: config.RequireMTLS},
 		a2asrv.WithAgentInactivityTimeout(2*time.Minute),
 		a2asrv.WithCapabilityChecks(&card.Capabilities),
 	)

@@ -72,6 +72,15 @@ type ProposalAuthorizer interface {
 	AuthorizeProposal(model.DiagnosisReport, model.DelegationGrant, time.Time) model.PolicyDecision
 }
 
+// WorkloadPolicyBinding is implemented by exact production policies. Monitor
+// uses it to discard unlisted/untrusted telemetry identities and seals the
+// effective policy digest into the grant for downstream drift detection.
+type WorkloadPolicyBinding interface {
+	BindingDigest() string
+	RequiresBinding() bool
+	AllowsSignal(model.ResourceTarget, model.EvidenceSource) bool
+}
+
 type GrantVerifier interface {
 	Verify(model.DelegationGrant, time.Time) error
 }
@@ -101,5 +110,6 @@ type ObserveBackend interface {
 // receives the complete signed grant, not independently supplied target args.
 type OperateBackend interface {
 	ExecuteRemediation(context.Context, toolapi.ExecuteRemediationInput) (toolapi.ExecuteRemediationOutput, error)
+	GetRemediationResult(context.Context, toolapi.GetRemediationResultInput) (toolapi.GetRemediationResultOutput, error)
 	GetRemediationStatus(context.Context, toolapi.GetRemediationStatusInput) (toolapi.GetRemediationStatusOutput, error)
 }

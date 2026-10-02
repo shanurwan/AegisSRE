@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-mcp-read
+spec:
+  template:
+    spec:
+      containers:
+        - name: mcp-read
+          env:
+            - name: AEGIS_PUBLIC_URL
+              value: https://aegis-mcp-read:8443
+            - name: AEGIS_WORKLOAD_POLICY_FILE
+              value: /etc/aegissre/policy/policy.json
+            - name: AEGIS_TLS_CERT_FILE
+              value: /var/run/secrets/aegissre/tls/tls.crt
+            - name: AEGIS_TLS_KEY_FILE
+              value: /var/run/secrets/aegissre/tls/tls.key
+            - name: AEGIS_TLS_CA_FILE
+              value: /var/run/secrets/aegissre/trust/ca.crt
+            - name: AEGIS_TLS_IDENTITY
+              value: spiffe://aegissre.internal/ns/outage-arena/sa/aegis-mcp-read
+          volumeMounts:
+            - name: workload-policy
+              mountPath: /etc/aegissre/policy
+              readOnly: true
+            - name: tls-leaf
+              mountPath: /var/run/secrets/aegissre/tls
+              readOnly: true
+            - name: tls-trust
+              mountPath: /var/run/secrets/aegissre/trust
+              readOnly: true
+      volumes:
+        - name: workload-policy
+          configMap:
+            name: aegis-workload-policy
+            optional: false
+            items:
+              - key: policy.json
+                path: policy.json
+        - name: tls-leaf
+          secret:
+            secretName: aegis-mcp-read-tls
+            optional: false
+            defaultMode: 288
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+        - name: tls-trust
+          secret:
+            secretName: aegis-mtls-ca
+            optional: false
+            defaultMode: 288
+            items:
+              - key: ca.crt
+                path: ca.crt

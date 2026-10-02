@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadRejectsMalformedSafetySettings(t *testing.T) {
@@ -64,11 +65,163 @@ func TestOperatorWhatsAppConfigurationIsAllOrNothing(t *testing.T) {
 	t.Setenv("AEGIS_WHATSAPP_RECIPIENT", "60123456789")
 	t.Setenv("AEGIS_WHATSAPP_TEMPLATE", "aegissre_incident_update")
 	t.Setenv("AEGIS_WHATSAPP_LANGUAGE", "en_US")
+	t.Setenv("AEGIS_DATABASE_URL", "postgres://aegis:secret@postgres/aegis?sslmode=require")
 	cfg, err := Load("operator")
 	if err != nil {
 		t.Fatalf("Load(operator) error = %v", err)
 	}
 	if !cfg.WhatsAppEnabled || cfg.WhatsAppGraphVersion != "v99.0" {
 		t.Fatalf("unexpected WhatsApp config: %#v", cfg)
+	}
+}
+
+func TestOperatorWhatsAppLeaseMustCoverProviderTimeout(t *testing.T) {
+	cfg, err := Load("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Role = "operator"
+	cfg.WhatsAppEnabled = true
+	cfg.DatabaseURL = "postgres://aegis:secret@postgres/aegis?sslmode=require"
+	cfg.WhatsAppGraphVersion = "v99.0"
+	cfg.WhatsAppPhoneID = "123456789"
+	cfg.WhatsAppAccessToken = "test-token"
+	cfg.WhatsAppRecipient = "60123456789"
+	cfg.WhatsAppTemplate = "aegissre_incident_update"
+	cfg.WhatsAppLanguage = "en_US"
+	cfg.RequestTimeout = 59 * time.Second
+	cfg.StateLease = time.Minute
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "AEGIS_STATE_LEASE") {
+		t.Fatalf("Validate() error = %v, want unsafe outbox lease rejection", err)
+	}
+	cfg.RequestTimeout = 10 * time.Second
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() safe outbox lease error = %v", err)
+	}
+}
+
+func TestDurableExecutionLeaseMustOutliveRequestAndRecoveryWindow(t *testing.T) {
+	for _, role := range []string{"operator", "mcp-action"} {
+		role := role
+		t.Run(role, func(t *testing.T) {
+			cfg, err := Load("test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.Role = role
+			cfg.DatabaseURL = "postgres://aegis:secret@postgres/aegis?sslmode=require"
+			cfg.RequestTimeout = 10 * time.Second
+
+			// Equality is unsafe: a former owner may still be in its bounded
+			// post-cancellation durable-write window at takeover time.
+			cfg.StateLease = cfg.RequestTimeout + durableExecutionLeaseSafetyMargin
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "durable execution fencing") {
+				t.Fatalf("Validate() error = %v, want unsafe durable lease rejection", err)
+			}
+
+			cfg.StateLease += time.Second
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() safe durable lease error = %v", err)
+			}
+		})
+	}
+}
+
+func TestLiveOperatorRequiresBoundMTLSAndDurableState(t *testing.T) {
+	t.Setenv("AEGIS_DRY_RUN", "false")
+	t.Setenv("AEGIS_WORKLOAD_POLICY_FILE", "/etc/aegissre/policy.json")
+	if _, err := Load("operator"); err == nil || !strings.Contains(err.Error(), "AEGIS_MTLS_ENABLED") {
+		t.Fatalf("Load(operator) without mTLS error = %v", err)
+	}
+
+	t.Setenv("AEGIS_MTLS_ENABLED", "true")
+	t.Setenv("AEGIS_LISTEN_ADDR", ":8443")
+	t.Setenv("AEGIS_ADMIN_LISTEN_ADDR", ":9090")
+	t.Setenv("AEGIS_PUBLIC_URL", "https://aegis-operator:8443")
+	t.Setenv("AEGIS_OBSERVE_MCP_URL", "https://aegis-mcp-read:8443/mcp")
+	t.Setenv("AEGIS_OPERATE_MCP_URL", "https://aegis-mcp-action:8443/mcp")
+	t.Setenv("AEGIS_INVESTIGATOR_URL", "https://aegis-investigator:8443")
+	t.Setenv("AEGIS_OPERATOR_URL", "https://aegis-operator:8443")
+	t.Setenv("AEGIS_TLS_CERT_FILE", "/var/run/secrets/aegissre/tls/tls.crt")
+	t.Setenv("AEGIS_TLS_KEY_FILE", "/var/run/secrets/aegissre/tls/tls.key")
+	t.Setenv("AEGIS_TLS_CA_FILE", "/var/run/secrets/aegissre/trust/ca.crt")
+	t.Setenv("AEGIS_TLS_IDENTITY", "spiffe://aegissre.internal/ns/aegissre-system/sa/aegis-operator")
+	if _, err := Load("operator"); err == nil || !strings.Contains(err.Error(), "durable PostgreSQL") {
+		t.Fatalf("Load(operator) without database error = %v", err)
+	}
+	t.Setenv("AEGIS_DATABASE_URL_FILE", "/var/run/secrets/aegissre/database/url")
+	t.Setenv("AEGIS_DELEGATION_PUBLIC_KEYRING_FILE", "/var/run/secrets/aegissre/signing/trusted-public-keys.json")
+	if _, err := Load("operator"); err != nil {
+		t.Fatalf("Load(operator) production configuration error = %v", err)
+	}
+	t.Setenv("AEGIS_TLS_IDENTITY", "spiffe://aegissre.internal/ns/aegissre-system/sa/aegis-monitor")
+	if _, err := Load("operator"); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("Load(operator) wrong local identity error = %v", err)
+	}
+}
+
+func TestAuthenticatedReadMCPRequiresExactWorkloadPolicy(t *testing.T) {
+	cfg, err := Load("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Role = "mcp-read"
+	cfg.MTLSEnabled = true
+	cfg.ListenAddr, cfg.AdminListenAddr = ":8443", ":9090"
+	cfg.PublicURL = "https://aegis-mcp-read:8443"
+	cfg.ObserveMCPURL = "https://aegis-mcp-read:8443/mcp"
+	cfg.OperateMCPURL = "https://aegis-mcp-action:8443/mcp"
+	cfg.InvestigatorURL = "https://aegis-investigator:8443"
+	cfg.OperatorURL = "https://aegis-operator:8443"
+	cfg.TLSCertificateFile = "/tls/tls.crt"
+	cfg.TLSPrivateKeyFile = "/tls/tls.key"
+	cfg.TLSCAFile = "/tls/ca.crt"
+	cfg.TLSIdentity = "spiffe://aegissre.internal/ns/aegissre-system/sa/aegis-mcp-read"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "AEGIS_WORKLOAD_POLICY_FILE") {
+		t.Fatalf("Validate() error = %v, want exact read policy requirement", err)
+	}
+	cfg.WorkloadPolicyPath = "/etc/aegissre/policy.json"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() authenticated read MCP error = %v", err)
+	}
+}
+
+func TestLiveFixtureActionBackendIsRejected(t *testing.T) {
+	cfg, err := Load("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Role = "mcp-action"
+	cfg.Backend = "fixture"
+	cfg.FixturePath = "fixture.json"
+	cfg.DryRun = false
+	cfg.AllowMutations = true
+	cfg.MTLSEnabled = true
+	cfg.ListenAddr, cfg.AdminListenAddr = ":8443", ":9090"
+	cfg.PublicURL = "https://aegis-mcp-action:8443"
+	cfg.ObserveMCPURL = "https://aegis-mcp-read:8443/mcp"
+	cfg.OperateMCPURL = "https://aegis-mcp-action:8443/mcp"
+	cfg.InvestigatorURL = "https://aegis-investigator:8443"
+	cfg.OperatorURL = "https://aegis-operator:8443"
+	cfg.TLSCertificateFile = "/tls/tls.crt"
+	cfg.TLSPrivateKeyFile = "/tls/tls.key"
+	cfg.TLSCAFile = "/tls/ca.crt"
+	cfg.TLSIdentity = "spiffe://aegissre.internal/ns/aegissre-system/sa/aegis-mcp-action"
+	cfg.WorkloadPolicyPath = "/etc/aegissre/policy.json"
+	cfg.DatabaseURL = "postgres://aegis:secret@postgres/aegis?sslmode=verify-full"
+	cfg.DelegationPublicKeysFile = "/signing/trusted-public-keys.json"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "fixture action backend") {
+		t.Fatalf("Validate() error = %v, want live fixture rejection", err)
+	}
+}
+
+func TestInstanceIDIsBounded(t *testing.T) {
+	cfg, err := Load("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.InstanceID = strings.Repeat("x", 513)
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "AEGIS_INSTANCE_ID") {
+		t.Fatalf("Validate() error = %v, want bounded instance ID rejection", err)
 	}
 }

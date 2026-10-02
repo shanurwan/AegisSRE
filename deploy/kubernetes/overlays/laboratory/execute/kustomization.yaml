@@ -1,0 +1,55 @@
+# This is the only checked-in production-derived overlay that enables writes.
+# Rendering or committing it is not authorization to apply it.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: outage-arena
+resources:
+  # Reference the production root directly. Referencing the parent laboratory
+  # Kustomization from its child creates a Kustomize traversal cycle.
+  - ../../production
+configMapGenerator:
+  - name: aegis-workload-policy
+    behavior: replace
+    files:
+      - policy.json=workload-policy.json
+generatorOptions:
+  labels:
+    app.kubernetes.io/part-of: aegissre
+patches:
+  - target:
+      group: rbac.authorization.k8s.io
+      version: v1
+      kind: Role
+      name: aegis-mcp-read
+    patch: |-
+      - op: replace
+        path: /rules/3/resourceNames/0
+        value: aegissre-e2e-canary
+  - target:
+      group: rbac.authorization.k8s.io
+      version: v1
+      kind: Role
+      name: aegis-mcp-action
+    patch: |-
+      - op: replace
+        path: /rules/0/resourceNames/0
+        value: aegissre-e2e-canary
+  - target:
+      version: v1
+      kind: ConfigMap
+      name: aegis-config
+    patch: |-
+      - op: replace
+        path: /data/AEGIS_DRY_RUN
+        value: "false"
+      - op: replace
+        path: /data/AEGIS_ALLOW_MUTATIONS
+        value: "true"
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+    patch: |-
+      - op: replace
+        path: /spec/template/metadata/annotations/aegissre.io~1release-profile
+        value: laboratory-execute

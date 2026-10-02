@@ -6,8 +6,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 )
+
+const maxPrivateKeyFileSize = 4096
 
 func decodeBase64Key(value string) ([]byte, error) {
 	value = strings.TrimSpace(value)
@@ -58,6 +61,27 @@ func ParsePrivateKeyBase64(value string) (ed25519.PrivateKey, error) {
 	default:
 		return nil, fmt.Errorf("parse Ed25519 private key: got %d bytes, want %d-byte seed or %d-byte key", len(decoded), ed25519.SeedSize, ed25519.PrivateKeySize)
 	}
+}
+
+// LoadPrivateKeyFile reads a bounded regular file containing only the base64
+// Ed25519 seed/private key. File mounts are preferred over environment values
+// because they avoid copying long-lived signing material into process env.
+func LoadPrivateKeyFile(path string) (ed25519.PrivateKey, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("Ed25519 private-key file is required")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("read Ed25519 private-key file: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxPrivateKeyFileSize {
+		return nil, errors.New("Ed25519 private-key file is empty, oversized, or not regular")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read Ed25519 private-key file: %w", err)
+	}
+	return ParsePrivateKeyBase64(string(data))
 }
 
 func EncodePublicKeyBase64(key ed25519.PublicKey) string {

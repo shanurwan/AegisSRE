@@ -1,0 +1,27 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-postgres-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - aegis-monitor
+          - aegis-operator
+          - aegis-mcp-action
+          - aegis-postgres-migrate
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: aegissre-data
+          podSelector:
+            matchLabels:
+              cnpg.io/cluster: aegis-postgres
+      ports:
+        - protocol: TCP
+          port: 5432

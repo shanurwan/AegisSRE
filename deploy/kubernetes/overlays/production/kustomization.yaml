@@ -1,0 +1,221 @@
+# This overlay is intentionally non-deployable until the zero digest and
+# placeholder workload are replaced by a reviewed release integration.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: outage-arena
+resources:
+  - ../../base
+  - otlp-egress.yaml
+  - postgres-egress.yaml
+  - postgres-migration.yaml
+configMapGenerator:
+  - name: aegis-workload-policy
+    files:
+      - policy.json=workload-policy.json
+generatorOptions:
+  labels:
+    app.kubernetes.io/part-of: aegissre
+images:
+  - name: ghcr.io/shanurwan/aegissre
+    newName: ghcr.io/shanurwan/aegissre
+    # A syntactically valid but deliberately nonexistent sentinel. Never replace
+    # this with a tag; release validation requires a non-zero sha256 digest.
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+patches:
+  - path: mcp-read-role.yaml
+  - path: mcp-action-role.yaml
+  - path: monitor-secret.yaml
+  - path: operator-secret.yaml
+  - path: mcp-action-secret.yaml
+  - path: investigator-transport.yaml
+  - path: mcp-read-transport.yaml
+  - target:
+      version: v1
+      kind: ConfigMap
+      name: aegis-config
+    patch: |-
+      - op: replace
+        path: /data/AEGIS_LISTEN_ADDR
+        value: ":8443"
+      - op: add
+        path: /data/AEGIS_ADMIN_LISTEN_ADDR
+        value: ":9090"
+      - op: add
+        path: /data/AEGIS_MTLS_ENABLED
+        value: "true"
+      - op: add
+        path: /data/AEGIS_TRUST_DOMAIN
+        value: aegissre.internal
+      - op: add
+        path: /data/AEGIS_SYSTEM_NAMESPACE
+        value: outage-arena
+      - op: replace
+        path: /data/AEGIS_OBSERVE_MCP_URL
+        value: https://aegis-mcp-read:8443/mcp
+      - op: replace
+        path: /data/AEGIS_OPERATE_MCP_URL
+        value: https://aegis-mcp-action:8443/mcp
+      - op: replace
+        path: /data/AEGIS_INVESTIGATOR_URL
+        value: https://aegis-investigator:8443
+      - op: replace
+        path: /data/AEGIS_OPERATOR_URL
+        value: https://aegis-operator:8443
+      - op: add
+        path: /data/OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+        value: http://otel-collector.observability.svc.cluster.local:4318/v1/traces
+      - op: add
+        path: /data/OTEL_EXPORTER_OTLP_PROTOCOL
+        value: http/protobuf
+      - op: add
+        path: /data/AEGIS_TRACE_SAMPLE_RATIO
+        value: "0.1"
+      - op: add
+        path: /data/AEGIS_DATABASE_MAX_CONNECTIONS
+        value: "8"
+      - op: add
+        path: /data/AEGIS_STATE_LEASE
+        value: 1m
+      - op: add
+        path: /data/AEGIS_OUTBOX_POLL_INTERVAL
+        value: 2s
+      - op: add
+        path: /data/AEGIS_OUTBOX_MAX_ATTEMPTS
+        value: "8"
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+    patch: |-
+      - op: replace
+        path: /spec/strategy
+        value:
+          type: Recreate
+      - op: add
+        path: /spec/revisionHistoryLimit
+        value: 2
+      - op: add
+        path: /spec/progressDeadlineSeconds
+        value: 300
+      - op: add
+        path: /spec/template/spec/enableServiceLinks
+        value: false
+      - op: add
+        path: /spec/template/spec/securityContext/fsGroup
+        value: 65532
+      - op: add
+        path: /spec/template/spec/securityContext/fsGroupChangePolicy
+        value: OnRootMismatch
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+      - op: replace
+        path: /spec/template/spec/containers/0/ports/0/name
+        value: https
+      - op: replace
+        path: /spec/template/spec/containers/0/ports/0/containerPort
+        value: 8443
+      - op: add
+        path: /spec/template/spec/containers/0/ports/-
+        value:
+          name: admin
+          containerPort: 9090
+          protocol: TCP
+      - op: replace
+        path: /spec/template/spec/containers/0/startupProbe/httpGet/port
+        value: admin
+      - op: replace
+        path: /spec/template/spec/containers/0/readinessProbe/httpGet/port
+        value: admin
+      - op: replace
+        path: /spec/template/spec/containers/0/livenessProbe/httpGet/port
+        value: admin
+      - op: add
+        path: /spec/template/metadata/annotations
+        value:
+          aegissre.io/release-profile: production-scaffold
+          aegissre.io/transport-assurance: authenticated-encrypted
+  - target:
+      version: v1
+      kind: Service
+    patch: |-
+      - op: replace
+        path: /spec/ports/0/name
+        value: https
+      - op: replace
+        path: /spec/ports/0/port
+        value: 8443
+      - op: replace
+        path: /spec/ports/0/targetPort
+        value: https
+      - op: replace
+        path: /spec/ports/0/appProtocol
+        value: https
+  - target:
+      group: networking.k8s.io
+      version: v1
+      kind: NetworkPolicy
+      name: aegis-(investigator|operator|mcp-read|mcp-action)-ingress
+    patch: |-
+      - op: replace
+        path: /spec/ingress/0/ports/0/port
+        value: 8443
+  - target:
+      group: networking.k8s.io
+      version: v1
+      kind: NetworkPolicy
+      name: aegis-(monitor|investigator|operator)-egress
+    patch: |-
+      - op: replace
+        path: /spec/egress/0/ports/0/port
+        value: 8443
+  - target:
+      group: networking.k8s.io
+      version: v1
+      kind: NetworkPolicy
+      name: aegis-dns-egress
+    patch: |-
+      - op: add
+        path: /spec/egress/0/to/0/podSelector
+        value:
+          matchLabels:
+            k8s-app: kube-dns
+  - target:
+      group: networking.k8s.io
+      version: v1
+      kind: NetworkPolicy
+      name: aegis-mcp-read-telemetry-egress
+    patch: |-
+      - op: replace
+        path: /spec/egress
+        value:
+          - to:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: observability
+                podSelector:
+                  matchLabels:
+                    app.kubernetes.io/instance: victoria-metrics
+            ports:
+              - protocol: TCP
+                port: 8428
+          - to:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: observability
+                podSelector:
+                  matchLabels:
+                    app.kubernetes.io/instance: victoria-logs
+            ports:
+              - protocol: TCP
+                port: 9428
+          - to:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: observability
+                podSelector:
+                  matchLabels:
+                    app.kubernetes.io/instance: victoria-traces
+            ports:
+              - protocol: TCP
+                port: 10428

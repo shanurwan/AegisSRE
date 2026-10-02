@@ -18,6 +18,7 @@ import (
 
 	"github.com/shanurwan/AegisSRE/internal/core/model"
 	"github.com/shanurwan/AegisSRE/internal/platform/httpclient"
+	"github.com/shanurwan/AegisSRE/internal/platform/observability"
 	"github.com/shanurwan/AegisSRE/internal/toolapi"
 )
 
@@ -529,7 +530,7 @@ func (v *Victoria) client() *http.Client {
 	if v.Client != nil {
 		return v.Client
 	}
-	return httpclient.Direct(10 * time.Second)
+	return observability.HTTPClient(httpclient.Direct(10 * time.Second))
 }
 
 func (v *Victoria) now() time.Time {
