@@ -49,14 +49,15 @@ Before starting Monitor:
 1. Confirm every process has a unique, correct public/listen URL.
 2. Confirm `AEGIS_ALLOWED_NAMESPACE=outage-arena`.
 3. Confirm `AEGIS_DRY_RUN=true` and `AEGIS_ALLOW_MUTATIONS=false` unless a reviewed live window is active.
-4. Confirm read MCP can reach VictoriaMetrics and VictoriaLogs.
+4. Confirm read MCP can reach VictoriaMetrics, VictoriaLogs, and VictoriaTraces; validate the required workload identity fields before enabling autonomous log/trace incidents.
 5. Confirm the read ServiceAccount can read only expected objects.
 6. Confirm action MCP has a public key but never a private key.
 7. Confirm `AEGIS_DELEGATION_KEY_ID` is identical on Monitor, Operator, and action MCP and identifies the distributed keypair.
 8. Confirm Monitor either has the intended private key or is deliberately diagnosis-only.
 9. Confirm system clocks are synchronized.
 10. Confirm the audit output is being collected and redacted.
-11. Confirm there is no unresolved prior condition whose pending-verification, cooldown, receipt, or replay state was lost on restart.
+11. Confirm there is no unresolved prior condition whose pending-verification, cooldown, receipt, report-deduplication, or replay state was lost on restart.
+12. If WhatsApp is enabled, confirm the approved template, pinned Graph version, scoped token, recipient, and restricted egress path with a non-production destination.
 
 Probe `/healthz` for process health and `/readyz` for completion of process initialization. Both endpoints are implemented, but `/readyz` is currently shallow and does not continuously check MCP, A2A, Victoria, Kubernetes, or model-provider dependencies. Scrape `/metrics` for Go/process/build metrics and perform direct bounded dependency checks during preflight.
 
@@ -66,7 +67,7 @@ OTLP export is not wired in the current binary, and the base manifests intention
 
 ### 1. Detection
 
-Monitor evaluates a server-owned metric template immediately at startup and then on its configured interval. It has no external trigger: inbound Monitor A2A requests are rejected, and the base NetworkPolicy grants Monitor no ingress. Capture:
+Monitor evaluates server-owned metric, structured-log, and trace templates immediately at startup and then on its configured interval. It has no external trigger: inbound Monitor A2A requests are rejected, and the base NetworkPolicy grants Monitor no ingress. Capture:
 
 - incident ID and first-seen time;
 - rule/template ID;
@@ -76,7 +77,7 @@ Monitor evaluates a server-owned metric template immediately at startup and then
 
 A single transient sample should not trigger a live change.
 
-The same rule/namespace/Deployment fingerprint must qualify in `AEGIS_VERIFICATION_COUNT` consecutive scans. Duplicate samples within one response count once. An incident ID is created only when the threshold is reached.
+The same rule/namespace/Deployment fingerprint must qualify in `AEGIS_VERIFICATION_COUNT` consecutive scans. Each signal rule keeps its own temporal counter; a workload-level cooldown/pending lock prevents simultaneous metric, log, and trace findings from authorizing parallel remediation. Duplicate samples within one response count once. An incident ID is created only when the threshold is reached.
 
 ### 2. Investigation
 
@@ -109,7 +110,7 @@ The current logger-only audit events contain incident, actor, operation, decisio
 
 Do not extend an expiring grant. Re-observe and issue a new grant if the incident and preconditions still hold.
 
-After diagnosis and before signing, Monitor fetches a fresh workload snapshot. If observed generation and replica availability already meet the health criteria, it returns `resolved_without_action` and emits no grant. Otherwise the grant binds that snapshot's resource version and expected replica count.
+After diagnosis and before signing, Monitor fetches a fresh workload snapshot. If observed generation and replica availability already meet the health criteria, it returns `resolved_without_action` and emits no grant. Otherwise the grant binds that snapshot's resource version and expected replica count. Investigator's exact proposal defines the task, but only Monitor's signed grant delegates authority.
 
 ### 4. Execution
 
@@ -124,9 +125,9 @@ Scale policy requires `requested replicas > signed expected replicas`; both equa
 
 ### 5. Verification
 
-After a `succeeded` live action, Monitor performs an immediate, bounded workload observation and resolves only if it meets availability criteria. If the observation fails or remains unhealthy, the original incident remains in `remediating` with outcome status `verification_pending`. Monitor stores that context in process memory and, at the start of every scheduled scan, retries the exact target observation before running new detection queries. It does so even when the original fingerprint is absent from current metrics or a later metric query fails. Pending verification blocks a new investigation or delegation for that fingerprint. These are read-only observation retries; Monitor never resends the action.
+After a `succeeded` live action, Monitor performs an immediate, bounded workload observation and resolves only if it meets availability criteria. If the observation fails or remains unhealthy, the original incident remains in `remediating` with outcome status `verification_pending`. Monitor stores that context in process memory and, at the start of every scheduled scan, retries the exact target observation before running new detection queries. It does so even when the original fingerprint is absent from the configured metric, log, or trace rules or a later detection query fails. Pending verification blocks a new investigation or delegation for that fingerprint. These are read-only observation retries; Monitor never resends the action.
 
-`AEGIS_INCIDENT_COOLDOWN` also sets the pending-verification window. A healthy follow-up resolves the original incident. If the window elapses while the workload is unhealthy or unreadable, Monitor transitions that incident to terminal `escalated`. Clearing pending state after either terminal result starts a fresh fingerprint cooldown. During that cooldown Monitor still polls metrics but starts no workflow. If the signal persists after cooldown, it must satisfy the consecutive-scan threshold again and receives a new incident ID, diagnosis, preconditions, and grant. A `dry_run` receipt is escalated immediately without inferring recovery or entering pending verification. Treat an unresolved operational condition as requiring one of:
+`AEGIS_INCIDENT_COOLDOWN` also sets the pending-verification window. A healthy follow-up resolves the original incident. If the window elapses while the workload is unhealthy or unreadable, Monitor transitions that incident to terminal `escalated`. Clearing pending state after either terminal result starts a fresh fingerprint cooldown. During that cooldown Monitor still evaluates configured metric, log, and trace rules but starts no workflow for that workload. If the signal persists after cooldown, it must satisfy the consecutive-scan threshold again and receives a new incident ID, diagnosis, preconditions, and grant. A `dry_run` receipt is escalated immediately without inferring recovery or entering pending verification. Treat an unresolved operational condition as requiring one of:
 
 - continue observing;
 - request a new investigation with fresh evidence;
@@ -134,6 +135,17 @@ After a `succeeded` live action, Monitor performs an immediate, bounded workload
 - execute a separately authorized rollback action, if one exists.
 
 An error before a grant resets consecutive confirmation, so a later attempt also starts from fresh verification. An error after a grant marks the incident failed and applies cooldown because the action result may be uncertain.
+
+### 6. Reporting and notification
+
+For every terminal outcome—including verified recovery, dry-run completion, verification timeout, inconclusive diagnosis, policy/authority denial, rejected or validated failed actions, and action outcomes that could not be verified—Monitor signs and sends a sanitized report request back to Operator. An ambiguous post-delegation outcome is terminal `escalated` with reason `action_outcome_unverified`; it is never asserted to be `failed` without a validated failed or rolled-back receipt. Operator verifies the distinct, short-lived report authorization before creating a sealed report and, when configured, sending the approved WhatsApp template. The report contains stable incident/target/state/reason fields and an optional exact receipt summary; it never includes raw logs, bearer tokens, grant signatures, or model-authored prose.
+
+Check both results independently:
+
+- incident `resolved`, `escalated`, or `failed` is the reliability result;
+- notification `delivered` or `failed` is only the messaging result.
+
+A failed WhatsApp request must not retry remediation or rewrite a recovered incident. Operator deduplicates identical request IDs in a bounded process-local cache; after eviction or restart, check the incident timeline before manually resending a report.
 
 ## Common failure procedures
 
@@ -156,6 +168,14 @@ Actions:
 ### VictoriaLogs unavailable
 
 Continue with other evidence only if policy permits an explicitly reduced evidence set. Mark log evidence unavailable. Do not convert arbitrary PromQL or Kubernetes reads into an unreviewed replacement tool.
+
+### VictoriaTraces unavailable or missing workload identity
+
+Continue metrics/log monitoring and mark trace evidence unavailable. Confirm the OTEL pipeline supplies authoritative `k8s.namespace.name` and `k8s.deployment.name` resource attributes. AegisSRE intentionally discards unscoped or ambiguously mapped traces; do not infer a Deployment from an arbitrary service name for autonomous action.
+
+### WhatsApp notification failed
+
+Confirm the incident terminal state first; notification failure does not mean remediation failed. Check Operator logs for the sanitized delivery status, Graph API version/template approval, token scope, recipient format, rate limits, and the restricted egress proxy. Never paste an access token into logs or broaden egress to all HTTPS destinations. Use the incident report ID as the idempotency reference and avoid duplicate manual sends after an Operator restart.
 
 ### Observe MCP unavailable
 
@@ -242,7 +262,8 @@ Provide:
 - timeline in UTC;
 - target resource and resource versions/generations;
 - bounded metric template and samples;
-- log query scope, not an uncontrolled full log dump;
+- bounded log detection/search scope, window, grouped counts, and workload-identity provenance—not an uncontrolled full log dump;
+- bounded trace template, window, grouped count, and the availability/provenance state of required Kubernetes resource attributes;
 - workload snapshot/events;
 - diagnosis and digest;
 - policy decisions from both verifiers;

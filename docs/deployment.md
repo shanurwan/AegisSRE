@@ -28,8 +28,8 @@ Use one immutable image with a different command and identity per workload:
 |---|---|---|---|
 | `aegis-monitor` | `aegissre monitor` | none | Investigator, Operator, observe MCP |
 | `aegis-investigator` | `aegissre investigator` | none | Observe MCP; external model only with an explicit overlay |
-| `aegis-operator` | `aegissre operator` | none | Action MCP |
-| `aegis-mcp-read` | `aegissre mcp-server --profile=read` | read-only ServiceAccount | Kubernetes API, VictoriaMetrics, VictoriaLogs |
+| `aegis-operator` | `aegissre operator` | none | Action MCP; WhatsApp only through reviewed egress when enabled |
+| `aegis-mcp-read` | `aegissre mcp-server --profile=read` | read-only ServiceAccount | Kubernetes API, VictoriaMetrics, VictoriaLogs, VictoriaTraces |
 | `aegis-mcp-action` | `aegissre mcp-server --profile=action` | minimal write ServiceAccount | Kubernetes API |
 
 Each workload listens on `:8080` by default. Give every workload a ClusterIP Service; do not expose agent or MCP endpoints through the public Gateway for the first deployment.
@@ -59,6 +59,7 @@ Set these values per workload. Defaults shown here reflect the application confi
 |---|---|---|
 | `AEGIS_LISTEN_ADDR` | `:8080` | all |
 | `AEGIS_PUBLIC_URL` | workload Service URL | all A2A-serving agents |
+| `AEGIS_LOG_LEVEL` | `info` | all |
 | `AEGIS_ALLOWED_NAMESPACE` | `outage-arena` | all; enforce again in both MCP planes |
 | `AEGIS_OBSERVE_MCP_URL` | `http://aegis-mcp-read:8080/mcp` | Monitor, Investigator |
 | `AEGIS_OPERATE_MCP_URL` | `http://aegis-mcp-action:8080/mcp` | Operator |
@@ -66,6 +67,7 @@ Set these values per workload. Defaults shown here reflect the application confi
 | `AEGIS_OPERATOR_URL` | `http://aegis-operator:8080` | Monitor |
 | `AEGIS_VICTORIA_METRICS_URL` | `http://vmsingle.observability.svc.cluster.local:8428` | read MCP |
 | `AEGIS_VICTORIA_LOGS_URL` | `http://vlogs.observability.svc.cluster.local:9428` | read MCP |
+| `AEGIS_VICTORIA_TRACES_URL` | `http://vtraces.observability.svc.cluster.local:10428` | read MCP |
 | `AEGIS_BACKEND` | `kubernetes` | MCP profiles |
 | `AEGIS_SCAN_INTERVAL` | begin conservatively, e.g. `30s` | Monitor |
 | `AEGIS_VERIFICATION_COUNT` | `2` or more | Monitor |
@@ -79,7 +81,28 @@ Set these values per workload. Defaults shown here reflect the application confi
 | `AEGIS_MAX_SCALE_INCREASE` | default `5`; validated range `1..AEGIS_MAX_SCALE_REPLICAS` | Monitor, Operator, action MCP |
 | `AEGIS_DRY_RUN` | `true` | Monitor, Operator, action MCP |
 | `AEGIS_ALLOW_MUTATIONS` | `false` | action MCP |
+| `AEGIS_ALLOW_LOG_TRACE_ACTIONS` | `false`; enable only after collector-owned workload identity is proven | Monitor |
+| `AEGIS_WHATSAPP_ENABLED` | `false`; opt in only after Secret and restricted egress are ready | Operator |
 The checked-in base explicitly pins both scale limits to the defaults. Keep the same values on Monitor, Operator, and action MCP so policy cannot disagree across verification boundaries.
+
+The Monitor private key and Operator public key also authorize and verify terminal report requests under a signature domain distinct from action grants. WhatsApp cannot operate safely without this key relationship; an A2A `sender` field is not authentication.
+
+### Optional WhatsApp incident reports
+
+Operator creates a sealed, sanitized report only after Monitor sends a terminal `incident.report.request`. It sends an approved WhatsApp template when `AEGIS_WHATSAPP_ENABLED=true`; replies are informational and never authorize an action. Configure only Operator:
+
+- `AEGIS_WHATSAPP_ENABLED`: explicit opt-in gate, default `false`;
+- `AEGIS_WHATSAPP_GRAPH_VERSION`: an explicitly pinned Graph API version supported by the Meta app;
+- `AEGIS_WHATSAPP_PHONE_NUMBER_ID`: Secret-backed sender phone-number ID;
+- `AEGIS_WHATSAPP_ACCESS_TOKEN`: Secret-backed, minimally scoped System User token with `whatsapp_business_messaging`;
+- `AEGIS_WHATSAPP_RECIPIENT`: Secret-backed destination digits without `+`;
+- `AEGIS_WHATSAPP_TEMPLATE`: approved template name containing one body variable;
+- `AEGIS_WHATSAPP_LANGUAGE`: approved template locale, default `en_US`;
+- `AEGIS_WHATSAPP_MAX_RETRIES`: bounded retry count for `429` and `5xx`, default `2`.
+
+The checked-in `aegis-whatsapp` Secret references are optional, and [`whatsapp-secret.example.yaml`](../deploy/kubernetes/base/whatsapp-secret.example.yaml) is deliberately excluded from Kustomize. The base keeps delivery disabled and gives Operator no Internet egress. Standard Kubernetes NetworkPolicy cannot safely express a DNS-name allowlist for `graph.facebook.com`; route Operator through a platform-owned egress proxy/gateway restricted to that host and port 443, then add only the namespace/pod-to-proxy rule. Do not add `0.0.0.0/0:443`.
+
+Delivery is best-effort until a durable outbox exists. Operator deduplicates up to 4,096 report requests in memory, but eviction or restart can lose that record. Notification failure is returned separately and never changes a resolved incident to failed.
 
 ### Optional reasoner
 
@@ -151,13 +174,14 @@ Start from default deny. Permit only this matrix:
 |---|---|---|
 | Monitor | read MCP | detection and verification |
 | Monitor | Investigator | A2A diagnosis task |
-| Monitor | Operator | A2A delegated action task |
+| Monitor | Operator | A2A delegated action task and non-authoritative terminal report request |
 | Investigator | read MCP | evidence collection |
 | Operator | action MCP | exact remediation call/status |
 | read MCP | Kubernetes API | bounded object reads/pod logs |
-| read MCP | VictoriaMetrics/VictoriaLogs | bounded signal queries |
+| read MCP | VictoriaMetrics/VictoriaLogs/VictoriaTraces | bounded signal queries |
 | action MCP | Kubernetes API | allowlisted mutations/status |
 | Investigator | approved model endpoint | not allowed by base; only through an explicit reviewed overlay |
+| Operator | approved WhatsApp egress proxy | not allowed by base; only when reporting is explicitly enabled |
 
 The checked-in policies permit DNS and the internal rows above. They grant no collector egress and deliberately block external model egress. Deny direct Operator-to-Kubernetes and Investigator-to-action-MCP traffic even if application policy would reject it.
 
@@ -223,6 +247,8 @@ Use Flux/GitOps to change workload configuration. Direct `kubectl edit` changes 
 - [ ] Dry-run produces a receipt and audit record without changing the target.
 - [ ] A durable audit sink has replaced the current logger-only adapter, and its failure fails closed for live writes.
 - [ ] A live-success receipt requires an immediate fresh observation; unhealthy/error results remain pending, block redelegation, and receive scheduled read-only follow-ups until recovery or verification-window expiry.
+- [ ] Log streams have an authoritative `aegissre.io/workload` identity and traces have authoritative `k8s.namespace.name`/`k8s.deployment.name` resource attributes; missing identity produces no autonomous incident.
+- [ ] WhatsApp remains disabled unless the template, scoped token, recipient handling, egress proxy, redaction, and restart/deduplication behavior have been reviewed and tested.
 - [ ] Rollback and manual containment have been rehearsed.
 - [ ] Security gaps listed in [security-model.md](security-model.md) have an explicit disposition.
 

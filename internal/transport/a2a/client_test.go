@@ -102,3 +102,34 @@ func TestConstrainCardAcceptsOnlySameOriginJSONRPCInterfaces(t *testing.T) {
 		t.Fatalf("same-origin card was rejected: %v", err)
 	}
 }
+
+func TestClientPreservesPeerErrorCode(t *testing.T) {
+	t.Parallel()
+	var application http.Handler
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		application.ServeHTTP(writer, request)
+	}))
+	defer server.Close()
+	var err error
+	application, _, err = NewHandler(CardConfig{
+		Name: "operator", Description: "test policy denial", PublicURL: server.URL,
+		SkillID: "operate", SkillName: "Operate",
+	}, func(context.Context, model.Envelope) (model.Envelope, error) {
+		return model.Envelope{}, model.NewError(model.CodePolicyDenied, "outside configured authority")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := model.NewEnvelope(
+		"request", "incident", "correlation", "", model.AgentMonitor,
+		model.AgentOperator, model.MessageRemediationRequest, time.Now(), map[string]string{"test": "value"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output model.Envelope
+	err = NewClient(5*time.Second).Send(context.Background(), server.URL, input, &output)
+	if code, ok := model.ErrorCodeOf(err); !ok || code != model.CodePolicyDenied {
+		t.Fatalf("Send() error = %v, want preserved %s code", err, model.CodePolicyDenied)
+	}
+}

@@ -21,6 +21,7 @@ type Config struct {
 	OperatorURL          string
 	VictoriaMetricsURL   string
 	VictoriaLogsURL      string
+	VictoriaTracesURL    string
 	Backend              string
 	FixturePath          string
 	Kubeconfig           string
@@ -32,6 +33,7 @@ type Config struct {
 	MaxLogBytes          int
 	DryRun               bool
 	AllowMutations       bool
+	AllowLogTraceActions bool
 	DelegationTTL        time.Duration
 	MaxScaleReplicas     int
 	MaxScaleIncrease     int
@@ -41,6 +43,14 @@ type Config struct {
 	LLMBaseURL           string
 	LLMAPIKey            string
 	LLMModel             string
+	WhatsAppEnabled      bool
+	WhatsAppGraphVersion string
+	WhatsAppPhoneID      string
+	WhatsAppAccessToken  string
+	WhatsAppRecipient    string
+	WhatsAppTemplate     string
+	WhatsAppLanguage     string
+	WhatsAppMaxRetries   int
 	LogLevel             string
 }
 
@@ -55,6 +65,7 @@ func Load(role string) (Config, error) {
 		"AEGIS_OPERATOR_URL",
 		"AEGIS_VICTORIA_METRICS_URL",
 		"AEGIS_VICTORIA_LOGS_URL",
+		"AEGIS_VICTORIA_TRACES_URL",
 		"AEGIS_BACKEND",
 		"AEGIS_DELEGATION_KEY_ID",
 		"AEGIS_LOG_LEVEL",
@@ -74,6 +85,7 @@ func Load(role string) (Config, error) {
 		OperatorURL:          strings.TrimRight(env("AEGIS_OPERATOR_URL", "http://127.0.0.1:8082"), "/"),
 		VictoriaMetricsURL:   strings.TrimRight(env("AEGIS_VICTORIA_METRICS_URL", "http://vmsingle.observability.svc.cluster.local:8428"), "/"),
 		VictoriaLogsURL:      strings.TrimRight(env("AEGIS_VICTORIA_LOGS_URL", "http://vlogs.observability.svc.cluster.local:9428"), "/"),
+		VictoriaTracesURL:    strings.TrimRight(env("AEGIS_VICTORIA_TRACES_URL", "http://vtraces.observability.svc.cluster.local:10428"), "/"),
 		Backend:              env("AEGIS_BACKEND", "kubernetes"),
 		FixturePath:          os.Getenv("AEGIS_FIXTURE_PATH"),
 		Kubeconfig:           os.Getenv("KUBECONFIG"),
@@ -83,6 +95,12 @@ func Load(role string) (Config, error) {
 		LLMBaseURL:           strings.TrimRight(os.Getenv("AEGIS_LLM_BASE_URL"), "/"),
 		LLMAPIKey:            os.Getenv("AEGIS_LLM_API_KEY"),
 		LLMModel:             strings.TrimSpace(os.Getenv("AEGIS_LLM_MODEL")),
+		WhatsAppGraphVersion: strings.TrimSpace(os.Getenv("AEGIS_WHATSAPP_GRAPH_VERSION")),
+		WhatsAppPhoneID:      strings.TrimSpace(os.Getenv("AEGIS_WHATSAPP_PHONE_NUMBER_ID")),
+		WhatsAppAccessToken:  strings.TrimSpace(os.Getenv("AEGIS_WHATSAPP_ACCESS_TOKEN")),
+		WhatsAppRecipient:    strings.TrimSpace(os.Getenv("AEGIS_WHATSAPP_RECIPIENT")),
+		WhatsAppTemplate:     env("AEGIS_WHATSAPP_TEMPLATE", "aegissre_incident_update"),
+		WhatsAppLanguage:     env("AEGIS_WHATSAPP_LANGUAGE", "en_US"),
 		LogLevel:             env("AEGIS_LOG_LEVEL", "info"),
 	}
 	var err error
@@ -110,6 +128,9 @@ func Load(role string) (Config, error) {
 	if cfg.AllowMutations, err = boolean("AEGIS_ALLOW_MUTATIONS", false); err != nil {
 		return Config{}, err
 	}
+	if cfg.AllowLogTraceActions, err = boolean("AEGIS_ALLOW_LOG_TRACE_ACTIONS", false); err != nil {
+		return Config{}, err
+	}
 	if cfg.DelegationTTL, err = duration("AEGIS_DELEGATION_TTL", 2*time.Minute); err != nil {
 		return Config{}, err
 	}
@@ -117,6 +138,12 @@ func Load(role string) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.MaxScaleIncrease, err = integer("AEGIS_MAX_SCALE_INCREASE", 5); err != nil {
+		return Config{}, err
+	}
+	if cfg.WhatsAppEnabled, err = boolean("AEGIS_WHATSAPP_ENABLED", false); err != nil {
+		return Config{}, err
+	}
+	if cfg.WhatsAppMaxRetries, err = integer("AEGIS_WHATSAPP_MAX_RETRIES", 2); err != nil {
 		return Config{}, err
 	}
 	if err := cfg.Validate(); err != nil {
@@ -153,6 +180,36 @@ func (c Config) Validate() error {
 	if c.LLMBaseURL != "" && (c.LLMModel == "" || strings.TrimSpace(c.LLMAPIKey) == "") {
 		return errors.New("AEGIS_LLM_MODEL and AEGIS_LLM_API_KEY are required when AEGIS_LLM_BASE_URL is set")
 	}
+	if c.WhatsAppMaxRetries < 0 || c.WhatsAppMaxRetries > 5 {
+		return errors.New("AEGIS_WHATSAPP_MAX_RETRIES must be between zero and five")
+	}
+	if c.WhatsAppEnabled && c.Role == "operator" {
+		for name, value := range map[string]string{
+			"AEGIS_WHATSAPP_PHONE_NUMBER_ID": c.WhatsAppPhoneID,
+			"AEGIS_WHATSAPP_ACCESS_TOKEN":    c.WhatsAppAccessToken,
+			"AEGIS_WHATSAPP_RECIPIENT":       c.WhatsAppRecipient,
+			"AEGIS_WHATSAPP_GRAPH_VERSION":   c.WhatsAppGraphVersion,
+			"AEGIS_WHATSAPP_TEMPLATE":        c.WhatsAppTemplate,
+			"AEGIS_WHATSAPP_LANGUAGE":        c.WhatsAppLanguage,
+		} {
+			if strings.TrimSpace(value) == "" {
+				return fmt.Errorf("%s is required when AEGIS_WHATSAPP_ENABLED=true for Operator", name)
+			}
+		}
+		if !validGraphVersion(c.WhatsAppGraphVersion) {
+			return errors.New("AEGIS_WHATSAPP_GRAPH_VERSION must be a pinned version such as v23.0")
+		}
+		if !digitsOnly(c.WhatsAppPhoneID) || len(c.WhatsAppPhoneID) > 32 ||
+			!digitsOnly(c.WhatsAppRecipient) || len(c.WhatsAppRecipient) < 6 || len(c.WhatsAppRecipient) > 32 {
+			return errors.New("WhatsApp phone-number ID and recipient must contain digits only")
+		}
+		if len(c.WhatsAppTemplate) > 512 || !validTemplateName(c.WhatsAppTemplate) {
+			return errors.New("AEGIS_WHATSAPP_TEMPLATE must contain lowercase letters, digits, and underscores only")
+		}
+		if !validLanguage(c.WhatsAppLanguage) {
+			return errors.New("AEGIS_WHATSAPP_LANGUAGE must use a supported locale form such as en_US")
+		}
+	}
 	for name, value := range map[string]string{
 		"AEGIS_PUBLIC_URL":           c.PublicURL,
 		"AEGIS_OBSERVE_MCP_URL":      c.ObserveMCPURL,
@@ -161,6 +218,7 @@ func (c Config) Validate() error {
 		"AEGIS_OPERATOR_URL":         c.OperatorURL,
 		"AEGIS_VICTORIA_METRICS_URL": c.VictoriaMetricsURL,
 		"AEGIS_VICTORIA_LOGS_URL":    c.VictoriaLogsURL,
+		"AEGIS_VICTORIA_TRACES_URL":  c.VictoriaTracesURL,
 	} {
 		if err := validateHTTPURL(name, value); err != nil {
 			return err
@@ -183,6 +241,66 @@ func (c Config) Validate() error {
 		return errors.New("AEGIS_FIXTURE_PATH is required for the fixture backend")
 	}
 	return nil
+}
+
+func validGraphVersion(value string) bool {
+	if len(value) < 4 || value[0] != 'v' {
+		return false
+	}
+	parts := strings.Split(value[1:], ".")
+	if len(parts) != 2 || !digitsOnly(parts[0]) || !digitsOnly(parts[1]) {
+		return false
+	}
+	major, err := strconv.Atoi(parts[0])
+	return err == nil && major > 0
+}
+
+func digitsOnly(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func validTemplateName(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func validLanguage(value string) bool {
+	parts := strings.Split(value, "_")
+	if len(parts) < 1 || len(parts) > 2 || len(parts[0]) < 2 || len(parts[0]) > 3 {
+		return false
+	}
+	for _, character := range parts[0] {
+		if character < 'a' || character > 'z' {
+			return false
+		}
+	}
+	if len(parts) == 1 {
+		return true
+	}
+	if len(parts[1]) != 2 {
+		return false
+	}
+	for _, character := range parts[1] {
+		if character < 'A' || character > 'Z' {
+			return false
+		}
+	}
+	return true
 }
 
 func validateHTTPURL(name, value string) error {

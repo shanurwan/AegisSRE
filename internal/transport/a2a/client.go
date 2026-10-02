@@ -70,6 +70,9 @@ func (c *Client) Send(ctx context.Context, endpoint string, envelope model.Envel
 	if state == a2a.TaskStateFailed || state == a2a.TaskStateRejected || state == a2a.TaskStateCanceled {
 		var failure map[string]string
 		if decodeDataPart(part, &failure) == nil && failure["message"] != "" {
+			if code := model.ErrorCode(failure["code"]); knownPeerErrorCode(code) {
+				return model.NewError(code, "peer A2A task "+string(state)+": "+failure["message"])
+			}
 			return fmt.Errorf("peer A2A task %s: %s", state, failure["message"])
 		}
 		return fmt.Errorf("peer A2A task ended in %s", state)
@@ -78,6 +81,19 @@ func (c *Client) Send(ctx context.Context, endpoint string, envelope model.Envel
 		return err
 	}
 	return nil
+}
+
+func knownPeerErrorCode(code model.ErrorCode) bool {
+	switch code {
+	case model.CodeInvalidInput, model.CodeInvalidStateTransition, model.CodeOutOfScope,
+		model.CodeDelegationRequired, model.CodePolicyDenied, model.CodeInvalidSignature,
+		model.CodeGrantNotYetValid, model.CodeGrantExpired, model.CodeReplayedGrant,
+		model.CodeStalePrecondition, model.CodeToolBudgetExceeded,
+		model.CodeInconclusiveDiagnosis, model.CodeExecutionFailed:
+		return true
+	default:
+		return false
+	}
 }
 
 func constrainCard(endpoint string, card *a2a.AgentCard) error {

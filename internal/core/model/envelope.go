@@ -21,11 +21,13 @@ const (
 type MessageKind string
 
 const (
-	MessageIncidentSignal       MessageKind = "incident.signal"
-	MessageInvestigationRequest MessageKind = "incident.investigate"
-	MessageDiagnosisReport      MessageKind = "diagnosis.report"
-	MessageRemediationRequest   MessageKind = "remediation.execute"
-	MessageActionReceipt        MessageKind = "action.receipt"
+	MessageIncidentSignal        MessageKind = "incident.signal"
+	MessageInvestigationRequest  MessageKind = "incident.investigate"
+	MessageDiagnosisReport       MessageKind = "diagnosis.report"
+	MessageRemediationRequest    MessageKind = "remediation.execute"
+	MessageActionReceipt         MessageKind = "action.receipt"
+	MessageIncidentReportRequest MessageKind = "incident.report.request"
+	MessageIncidentReport        MessageKind = "incident.report"
 )
 
 // Envelope is the stable wire envelope carried in an A2A structured-data

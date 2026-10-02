@@ -52,7 +52,8 @@ func TestInvestigateHonorsEvidenceAndToolCallBudgets(t *testing.T) {
 			}
 			for _, name := range tools.calls {
 				switch name {
-				case toolapi.ToolGetWorkloadSnapshot, toolapi.ToolGetPodLogs:
+				case toolapi.ToolGetWorkloadSnapshot, toolapi.ToolQueryMetrics,
+					toolapi.ToolQueryLogSignals, toolapi.ToolQueryTraceSignals, toolapi.ToolGetPodLogs:
 					// These are the only read-only tools used by this investigation path.
 				default:
 					t.Fatalf("Investigator called non-read or unexpected tool %q", name)
@@ -71,7 +72,10 @@ type investigatorToolFake struct {
 }
 
 func (f *investigatorToolFake) Discover(context.Context) ([]string, error) {
-	return []string{toolapi.ToolGetWorkloadSnapshot, toolapi.ToolGetPodLogs}, nil
+	return []string{
+		toolapi.ToolGetWorkloadSnapshot, toolapi.ToolQueryMetrics,
+		toolapi.ToolQueryLogSignals, toolapi.ToolQueryTraceSignals, toolapi.ToolGetPodLogs,
+	}, nil
 }
 
 func (f *investigatorToolFake) Call(_ context.Context, name string, input, output any) error {
@@ -106,6 +110,40 @@ func (f *investigatorToolFake) Call(_ context.Context, name string, input, outpu
 		result.Pod = request.Pod
 		result.Container = request.Container
 		result.Logs = "bounded fixture log"
+		return nil
+	case toolapi.ToolQueryMetrics:
+		request, ok := input.(toolapi.QueryMetricsInput)
+		if !ok || request.Namespace != "outage-arena" || request.Workload != "demo-api" {
+			return fmt.Errorf("metric request escaped target: %#v", input)
+		}
+		result, ok := output.(*toolapi.QueryMetricsOutput)
+		if !ok {
+			return fmt.Errorf("unexpected metric output %T", output)
+		}
+		result.TemplateID = request.TemplateID
+		result.ObservedAt = f.snapshot.ObservedAt
+		return nil
+	case toolapi.ToolQueryLogSignals:
+		request, ok := input.(toolapi.QueryLogSignalsInput)
+		if !ok || request.Namespace != "outage-arena" || request.Workload != "demo-api" {
+			return fmt.Errorf("log signal request escaped target: %#v", input)
+		}
+		result, ok := output.(*toolapi.QueryLogSignalsOutput)
+		if !ok {
+			return fmt.Errorf("unexpected log signal output %T", output)
+		}
+		result.TemplateID = request.TemplateID
+		return nil
+	case toolapi.ToolQueryTraceSignals:
+		request, ok := input.(toolapi.QueryTraceSignalsInput)
+		if !ok || request.Namespace != "outage-arena" || request.Workload != "demo-api" {
+			return fmt.Errorf("trace signal request escaped target: %#v", input)
+		}
+		result, ok := output.(*toolapi.QueryTraceSignalsOutput)
+		if !ok {
+			return fmt.Errorf("unexpected trace signal output %T", output)
+		}
+		result.TemplateID = request.TemplateID
 		return nil
 	default:
 		return fmt.Errorf("unexpected tool %q", name)

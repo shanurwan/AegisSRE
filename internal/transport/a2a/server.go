@@ -91,7 +91,10 @@ func (*executor) fail(execCtx *a2asrv.ExecutorContext, err error, yield func(a2a
 	if !ok {
 		code = model.CodeExecutionFailed
 	}
-	payload := map[string]string{"code": string(code), "message": err.Error()}
+	// Keep the artifact in the same structured-data representation as normal
+	// A2A envelopes. The SDK's task processor deep-copies this value and does
+	// not register map[string]string as an interface-backed gob type.
+	payload := map[string]any{"code": string(code), "message": err.Error()}
 	artifact := a2a.NewArtifactEvent(execCtx, a2a.NewDataPart(payload))
 	artifact.LastChunk = true
 	if !yield(artifact, nil) {

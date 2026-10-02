@@ -218,8 +218,8 @@ func (r ActionReceipt) Validate() error {
 	if r.CompletedAt.Before(r.StartedAt) {
 		return NewError(CodeInvalidInput, "receipt completed_at precedes started_at")
 	}
-	if r.Outcome == ActionDryRun && !r.DryRun {
-		return NewError(CodeInvalidInput, "dry-run receipt must set dry_run")
+	if r.DryRun != (r.Outcome == ActionDryRun) {
+		return NewError(CodeInvalidInput, "receipt dry_run must exactly match a dry-run outcome")
 	}
 	if r.Outcome == ActionFailed || r.Outcome == ActionRejected {
 		if r.ErrorCode == "" || r.ErrorMessage == "" {

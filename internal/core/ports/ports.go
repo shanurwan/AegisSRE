@@ -43,9 +43,22 @@ type Auditor interface {
 	Record(context.Context, model.AuditEvent) error
 }
 
+// Notifier delivers an already-sanitized, sealed incident report. Recipient
+// routing and credentials belong to the adapter and never come from agent or
+// model-generated input.
+type Notifier interface {
+	Notify(context.Context, model.IncidentReport) (model.NotificationDelivery, error)
+}
+
 // GrantSigner is held only by Monitor.
 type GrantSigner interface {
 	Sign(*model.DelegationGrant) error
+}
+
+// ReportRequestSigner is held only by Monitor. It authorizes a sanitized
+// terminal-report request but grants no action-plane capability.
+type ReportRequestSigner interface {
+	SignReportRequest(*model.IncidentReportRequest) error
 }
 
 // GrantAuthorizer is used independently by Operator and the action MCP server.
@@ -63,6 +76,12 @@ type GrantVerifier interface {
 	Verify(model.DelegationGrant, time.Time) error
 }
 
+// ReportRequestVerifier is held by Operator and is intentionally narrower
+// than delegation verification.
+type ReportRequestVerifier interface {
+	VerifyReportRequest(model.IncidentReportRequest, time.Time) error
+}
+
 type ReplayGuard interface {
 	ConsumeGrant(model.DelegationGrant, time.Time) error
 }
@@ -71,6 +90,8 @@ type ReplayGuard interface {
 // server. It has no method capable of changing cluster state.
 type ObserveBackend interface {
 	QueryMetrics(context.Context, toolapi.QueryMetricsInput) (toolapi.QueryMetricsOutput, error)
+	QueryLogSignals(context.Context, toolapi.QueryLogSignalsInput) (toolapi.QueryLogSignalsOutput, error)
+	QueryTraceSignals(context.Context, toolapi.QueryTraceSignalsInput) (toolapi.QueryTraceSignalsOutput, error)
 	SearchLogs(context.Context, toolapi.SearchLogsInput) (toolapi.SearchLogsOutput, error)
 	GetWorkloadSnapshot(context.Context, toolapi.GetWorkloadSnapshotInput) (toolapi.GetWorkloadSnapshotOutput, error)
 	GetPodLogs(context.Context, toolapi.GetPodLogsInput) (toolapi.GetPodLogsOutput, error)

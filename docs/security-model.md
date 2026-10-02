@@ -12,9 +12,9 @@ This model reduces risk; it does not make autonomous remediation intrinsically s
 
 ## Current implementation boundary
 
-The core security slice is implemented and unit-tested: versioned envelopes, incident state transitions, SHA-256-sealed evidence and diagnoses, exact restart/scale action types, Ed25519 signing/verification, proposal and runtime policy checks, and a concurrency-safe in-memory replay guard. The executable wires these controls through A2A and MCP, and the fixture integration test covers signed dry-run delegation across both independent verification boundaries. Canonical grant bytes normalize timestamps to UTC, sort the two required audiences, omit the signature field, use a domain-separated signature input, reject unknown/trailing JSON at strict boundaries, and cap the canonical payload at 64 KiB.
+The core security slice is implemented and unit-tested: versioned envelopes, incident state transitions, SHA-256-sealed evidence and diagnoses, exact restart/scale action types, Ed25519 signing/verification, proposal and runtime policy checks, and a concurrency-safe in-memory replay guard. The executable wires these controls through A2A and MCP. Deterministic in-process control-plane E2E tests cross real MCP, A2A, and notification HTTP boundaries, covering a successful signed live fixture recovery and an outside-authority escalation with zero action calls; a separate integration test covers safe dry-run delegation across both independent verification boundaries. These tests are not separate-process Compose or live-k3s E2E. Canonical grant bytes normalize timestamps to UTC, sort the two required audiences, omit the signature field, use a domain-separated signature input, reject unknown/trailing JSON at strict boundaries, and cap the canonical payload at 64 KiB.
 
-The replay guard and Monitor's pending-verification tracker are process-local. Transport identity/TLS, durable shared replay/audit/incident state, key rotation, and live-cluster validation remain production gaps.
+The replay guard, Monitor's pending-verification tracker, and Operator's report/notification dedupe cache are process-local. Transport identity/TLS, durable shared replay/audit/incident/outbox state, key rotation, and live-cluster validation remain production gaps.
 
 ## Safety properties
 
@@ -27,6 +27,7 @@ The replay guard and Monitor's pending-verification tracker are process-local. T
 7. **Dry-run fails safe.** Live writes require multiple independent gates; missing or ambiguous configuration remains non-mutating.
 8. **An API receipt is not recovery.** Monitor must collect fresh evidence before declaring an incident resolved and retry bounded observations, not the action, while verification is pending.
 9. **No authority through prose.** Free-form A2A messages, model output, log text, and tool descriptions cannot change policy.
+10. **Notification is non-authoritative.** WhatsApp content and replies cannot approve an action, and delivery failure cannot change incident recovery state.
 
 ## Trust zones and credentials
 
@@ -34,7 +35,7 @@ The replay guard and Monitor's pending-verification tracker are process-local. T
 |---|---|---|
 | Monitor | Ed25519 delegation private key; observe-plane client identity | Kubernetes write credentials, action-plane ServiceAccount token |
 | Investigator | Observe-plane client identity; optional model provider credential | Delegation private key, action-plane identity, Kubernetes credentials |
-| Operator | Delegation public key; action-plane client identity | Delegation private key, direct Kubernetes token |
+| Operator | Delegation public key; action-plane client identity; optional WhatsApp token and recipient | Delegation private key, direct Kubernetes token |
 | Observe MCP | Read-only Kubernetes identity and telemetry access | Delegation private key, Kubernetes writes |
 | Action MCP | Delegation public key and minimal write ServiceAccount | Delegation private key, cluster-admin, secret-read access |
 | Fixture environment | Disposable development keys only | Production keys or production telemetry credentials |
@@ -54,6 +55,7 @@ The design assumes an attacker or accidental input may:
 - try to escape `outage-arena` through crafted Kubernetes names;
 - make telemetry unavailable, stale, or internally inconsistent;
 - obtain an audit log without obtaining secret material.
+- induce duplicate, oversized, redirected, or rate-limited external notification requests.
 
 The baseline does not claim to defend against full node compromise, compromise of the Kubernetes control plane, theft of both signing and action credentials, malicious changes to the running image, or a platform administrator intentionally bypassing policy.
 
@@ -127,6 +129,7 @@ The default environment is:
 ```dotenv
 AEGIS_DRY_RUN=true
 AEGIS_ALLOW_MUTATIONS=false
+AEGIS_ALLOW_LOG_TRACE_ACTIONS=false
 ```
 
 A live write is permitted only when all applicable conditions agree:
@@ -146,12 +149,13 @@ If any condition is absent, contradictory, expired, or cannot be checked, the re
 ### Observe plane
 
 - PromQL is selected from server-owned templates. The caller supplies bounded labels, not query text.
+- Autonomous log/trace queries are server-owned five-minute templates with fixed timeouts and response caps. Results require an exact allowed namespace and Deployment identity; ambiguous identity fails closed.
 - Log search restricts Kubernetes names, lookback, match length, result lines, and bytes.
 - Workload snapshots expose the evidence needed for diagnosis without returning arbitrary Secrets or ConfigMaps.
 - Pod logs are explicitly capped and may still contain sensitive application data; apply platform redaction and access policy.
 - Tool results are evidence, never instructions. Treat their strings as hostile input to a reasoner.
 
-Investigator uses a deterministic heuristic by default. The optional Responses API reasoner is enabled only when `AEGIS_LLM_BASE_URL`, `AEGIS_LLM_API_KEY`, and `AEGIS_LLM_MODEL` are configured; configuration fails if the base URL is set without the other two. Provider errors fall back to the deterministic reasoner, while a valid inconclusive provider response is retained. Strict structured output, evidence-citation validation, bounded prompts/responses, and trusted-target binding reduce model risk but do not make model output authoritative.
+Investigator uses a deterministic heuristic by default. The optional Responses API reasoner is enabled only when `AEGIS_LLM_BASE_URL`, `AEGIS_LLM_API_KEY`, and `AEGIS_LLM_MODEL` are configured; configuration fails if the base URL is set without the other two. Provider errors fall back to the deterministic reasoner, while a valid inconclusive provider response is retained. Before prompt serialization, the external-provider projection removes the query and raw payload from `logs_search` and `k8s_get_pod_logs` evidence, retaining only the sealed item's ID, source, tool, summary, timestamp, and a fixed non-secret marker. The local evidence and deterministic reasoner remain unchanged. Strict structured output, evidence-citation validation, bounded prompts/responses, and trusted-target binding reduce model risk but do not make model output authoritative.
 
 ### Action plane
 
@@ -161,6 +165,18 @@ Investigator uses a deterministic heuristic by default. The optional Responses A
 - A scale request must be strictly greater than the signed expected replica count; equality and lower values are denied. By default the requested total cannot exceed 20 and `requested - expected` cannot exceed 5. Keep `AEGIS_MAX_SCALE_REPLICAS` and `AEGIS_MAX_SCALE_INCREASE` consistent on Monitor, Operator, and action MCP.
 - Apply a server-side namespace allowlist even when RBAC is already namespaced.
 - Return bounded structured receipts without credential material or complete sensitive objects.
+
+### Notification plane
+
+- Monitor signs each exact report request in a domain separate from action delegation, binding Monitor issuer, Operator audience, incident/correlation chain, target, terminal state/reason, key ID, and a maximum five-minute validity window.
+- Operator requires both the Monitor A2A role and a trusted report-request signature before receipt lookup, report creation, or notification; unsigned, spoofed, tampered, premature, and expired requests fail closed.
+- Report prose is chosen from a closed reason enum; raw telemetry, model text, grant signatures, credentials, receipt-controlled timestamps, and the internal report digest are never copied into a WhatsApp template.
+- The adapter uses only a configured recipient, pinned Graph API version, fixed Meta host, approved template name, bounded response, disabled redirects, and bounded retry for `429`/`5xx`.
+- The access token and recipient are Operator-only Secrets. They do not belong in Monitor, Investigator, MCP servers, ConfigMaps, logs, or incident payloads.
+- A report request grants no Kubernetes capability and never calls the action MCP. Invalid senders, signatures, chains, execution semantics, or receipt references fail before notification.
+- Monitor accepts execution data in a report response only when every field is the exact projection of its validated receipt and the grant/receipt IDs were present in the signed request. An absent, malformed, or ambiguous action response escalates as `action_outcome_unverified`; only a validated failed or rolled-back receipt can produce `action_failed`.
+- A bounded process-local request-ID cache (4,096 entries) prevents duplicate sends only until eviction or Operator restart. Production delivery still needs a durable transactional outbox/idempotency record.
+- WhatsApp replies are not an approval channel. Any future inbound webhook requires separate signature verification, replay protection, body caps, public-edge isolation, and authorization design.
 
 ## A2A and MCP transport security
 

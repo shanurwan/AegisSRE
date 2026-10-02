@@ -3,14 +3,15 @@ DOCKER ?= docker
 KUBECTL ?= kubectl
 BINARY ?= build/aegissre
 
-.PHONY: help build test test-race vet verify fmt keygen \
+.PHONY: help build test test-e2e test-race vet verify fmt keygen \
 	run-monitor run-investigator run-operator run-mcp-read run-mcp-action \
 	compose-up compose-down compose-logs manifests-dry-run manifests-execute
 
 help:
 	@echo "AegisSRE targets"
 	@echo "  build              build $(BINARY)"
-	@echo "  test               run unit tests"
+	@echo "  test               run all Go package tests"
+	@echo "  test-e2e           run the full MCP/A2A/remediation/reporting workflow"
 	@echo "  test-race          run tests with the race detector"
 	@echo "  vet                run go vet"
 	@echo "  verify             run vet and tests without rewriting files"
@@ -28,6 +29,10 @@ build:
 
 test:
 	$(GO) test ./...
+
+test-e2e:
+	@test "$$($(GO) test -list '^TestE2E' ./internal/integration | grep -c '^TestE2E')" -ge 2
+	$(GO) test -count=1 -timeout=30s -run '^TestE2E' ./internal/integration
 
 test-race:
 	$(GO) test -race ./...

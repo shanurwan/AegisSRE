@@ -1,12 +1,16 @@
 package monitor
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/shanurwan/AegisSRE/internal/core/model"
+	"github.com/shanurwan/AegisSRE/internal/security"
 	"github.com/shanurwan/AegisSRE/internal/toolapi"
 )
 
@@ -34,8 +38,8 @@ func TestScanDoesNotDelegateBeforeVerificationThreshold(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Scan() error = %v", err)
 	}
-	if len(peers.endpoints) != 1 || peers.endpoints[0] != service.InvestigatorURL {
-		t.Fatalf("peer calls after verification = %v, want Investigator only", peers.endpoints)
+	if len(peers.endpoints) != 2 || peers.endpoints[0] != service.InvestigatorURL || peers.endpoints[1] != service.OperatorURL {
+		t.Fatalf("peer calls after verification = %v, want Investigator then Operator report", peers.endpoints)
 	}
 	if len(second.Outcomes) != 1 || second.Outcomes[0].Status != "escalated" {
 		t.Fatalf("second Scan() outcomes = %#v, want inconclusive escalation", second.Outcomes)
@@ -69,8 +73,8 @@ func TestScanWithoutSigningKeyStopsAfterDiagnosis(t *testing.T) {
 	if outcome.Incident.State != model.IncidentEscalated {
 		t.Fatalf("incident state = %q, want %q", outcome.Incident.State, model.IncidentEscalated)
 	}
-	if len(peers.endpoints) != 1 || peers.endpoints[0] != service.InvestigatorURL {
-		t.Fatalf("peer calls = %v, want Investigator only and no Operator delegation", peers.endpoints)
+	if len(peers.endpoints) != 2 || peers.kinds[1] != model.MessageIncidentReportRequest {
+		t.Fatalf("peer calls = %v (%v), want Investigator then non-authoritative Operator report", peers.endpoints, peers.kinds)
 	}
 	if got := tools.count(toolapi.ToolGetWorkloadSnapshot); got != 1 {
 		t.Fatalf("precondition snapshot calls = %d, want 1", got)
@@ -122,6 +126,146 @@ func TestMetricFailureBreaksConsecutiveVerification(t *testing.T) {
 	}
 }
 
+func TestTelemetryRulesKeepIndependentVerificationCounters(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 30, 6, 55, 0, 0, time.UTC)
+	logSignal := toolapi.DetectionSample{Namespace: "outage-arena", Workload: "demo-api", Timestamp: now, Value: 5}
+	traceSignal := toolapi.DetectionSample{Namespace: "outage-arena", Workload: "demo-api", Timestamp: now, Value: 3}
+	tools := &monitorToolFake{now: now, noDefaultMetric: true, logSamples: []toolapi.DetectionSample{logSignal}}
+	peers := &monitorPeerFake{now: now, diagnosisStatus: model.DiagnosisInconclusive}
+	service := monitorService(now, tools, peers)
+	service.VerificationCount = 2
+
+	first, err := service.Scan(context.Background(), ScanRequest{})
+	if err != nil || len(first.Outcomes) != 0 {
+		t.Fatalf("first log observation = %#v, %v", first, err)
+	}
+	tools.logSamples = nil
+	tools.traceSamples = []toolapi.DetectionSample{traceSignal}
+	second, err := service.Scan(context.Background(), ScanRequest{})
+	if err != nil || len(second.Outcomes) != 0 {
+		t.Fatalf("first trace observation reused the log counter: %#v, %v", second, err)
+	}
+	third, err := service.Scan(context.Background(), ScanRequest{})
+	if err != nil || len(third.Outcomes) != 1 {
+		t.Fatalf("second trace observation did not verify: %#v, %v", third, err)
+	}
+}
+
+func TestConcurrentTelemetrySignalsProduceOneWorkloadIncident(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 30, 6, 57, 0, 0, time.UTC)
+	tools := &monitorToolFake{
+		now: now,
+		logSamples: []toolapi.DetectionSample{{
+			Namespace: "outage-arena", Workload: "demo-api", Timestamp: now, Value: 5,
+		}},
+		traceSamples: []toolapi.DetectionSample{{
+			Namespace: "outage-arena", Workload: "demo-api", Timestamp: now, Value: 3,
+		}},
+	}
+	peers := &monitorPeerFake{now: now, diagnosisStatus: model.DiagnosisInconclusive}
+	service := monitorService(now, tools, peers)
+	service.VerificationCount = 1
+	result, err := service.Scan(context.Background(), ScanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Candidates != 3 || len(result.Outcomes) != 1 {
+		t.Fatalf("cross-signal dedupe result = %#v, want three candidates and one incident", result)
+	}
+}
+
+func TestLiveLogSignalRequiresExplicitProvenanceOptIn(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 30, 6, 58, 0, 0, time.UTC)
+	tools := &monitorToolFake{
+		now: now, noDefaultMetric: true,
+		logSamples: []toolapi.DetectionSample{{
+			Namespace: "outage-arena", Workload: "demo-api", Timestamp: now, Value: 5,
+		}},
+	}
+	peers := &monitorPeerFake{now: now, diagnosisStatus: model.DiagnosisConfirmed}
+	service := monitorService(now, tools, peers)
+	service.VerificationCount = 1
+	service.DryRun = false
+
+	result, err := service.Scan(context.Background(), ScanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Outcomes) != 1 {
+		t.Fatalf("outcomes = %#v, want one policy escalation", result.Outcomes)
+	}
+	outcome := result.Outcomes[0]
+	if outcome.Status != "escalated" || outcome.Incident.State != model.IncidentEscalated || outcome.Grant != nil {
+		t.Fatalf("untrusted log identity authorized a live action: %#v", outcome)
+	}
+	if outcome.Report == nil || outcome.Report.Report.Reason != model.ReportReasonPolicyDenied {
+		t.Fatalf("blocked live log action did not produce a terminal policy report: %#v", outcome.Report)
+	}
+	if len(peers.kinds) != 2 || peers.kinds[0] != model.MessageInvestigationRequest || peers.kinds[1] != model.MessageIncidentReportRequest {
+		t.Fatalf("unexpected live log workflow messages: %v", peers.kinds)
+	}
+}
+
+func TestRuleCannotMislabelLogToolAsTrustedMetricEvidence(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 30, 6, 58, 30, 0, time.UTC)
+	tools := &monitorToolFake{
+		now: now, noDefaultMetric: true,
+		logSamples: []toolapi.DetectionSample{{
+			Namespace: "outage-arena", Workload: "demo-api", Timestamp: now, Value: 5,
+		}},
+	}
+	peers := &monitorPeerFake{now: now, diagnosisStatus: model.DiagnosisConfirmed}
+	service := monitorService(now, tools, peers)
+	service.Rules = []Rule{{
+		ID: "mislabelled-log-rule", Tool: toolapi.ToolQueryLogSignals, Source: model.EvidenceMetrics,
+		TemplateID: toolapi.LogErrorBurst5m, Threshold: 5, Severity: model.SeverityWarning,
+		Summary: "mislabelled log signal",
+	}}
+	service.VerificationCount = 1
+	service.DryRun = false
+	service.AllowLogTraceActions = true
+
+	result, err := service.Scan(context.Background(), ScanRequest{})
+	if err == nil {
+		t.Fatal("rule with a mismatched tool/source trust label was accepted")
+	}
+	if result.Candidates != 0 || len(result.Outcomes) != 0 || len(peers.kinds) != 0 {
+		t.Fatalf("mislabelled rule reached the incident workflow: result=%#v peers=%v", result, peers.kinds)
+	}
+}
+
+func TestDetectionResultValidationFailsClosed(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 30, 6, 59, 0, 0, time.UTC)
+	valid := toolapi.DetectionSample{
+		Namespace: "outage-arena", Workload: "demo-api", Timestamp: now, Value: 5,
+	}
+	tests := []struct {
+		name    string
+		samples []toolapi.DetectionSample
+		start   time.Time
+		end     time.Time
+	}{
+		{name: "cross namespace", samples: []toolapi.DetectionSample{{Namespace: "other", Workload: "demo-api", Timestamp: now, Value: 5}}, start: now.Add(-5 * time.Minute), end: now},
+		{name: "fractional count", samples: []toolapi.DetectionSample{{Namespace: "outage-arena", Workload: "demo-api", Timestamp: now, Value: 1.5}}, start: now.Add(-5 * time.Minute), end: now},
+		{name: "stale window", samples: []toolapi.DetectionSample{valid}, start: now.Add(-25 * time.Minute), end: now.Add(-20 * time.Minute)},
+		{name: "duplicate identity", samples: []toolapi.DetectionSample{valid, valid}, start: now.Add(-5 * time.Minute), end: now},
+		{name: "too many groups", samples: make([]toolapi.DetectionSample, maxDetectionSamples+1), start: now.Add(-5 * time.Minute), end: now},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := validateNormalizedSamples(test.samples, "outage-arena", test.start, test.end, now); err == nil {
+				t.Fatal("malformed detection result was accepted")
+			}
+		})
+	}
+}
+
 func TestFreshHealthySnapshotStopsBeforeDelegation(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 9, 30, 7, 0, 0, 0, time.UTC)
@@ -136,7 +280,7 @@ func TestFreshHealthySnapshotStopsBeforeDelegation(t *testing.T) {
 	if len(result.Outcomes) != 1 || result.Outcomes[0].Status != "resolved_without_action" {
 		t.Fatalf("self-recovered workload did not stop before delegation: %#v", result.Outcomes)
 	}
-	if result.Outcomes[0].Grant != nil || len(peers.endpoints) != 1 {
+	if result.Outcomes[0].Grant != nil || len(peers.endpoints) != 2 || peers.kinds[1] != model.MessageIncidentReportRequest {
 		t.Fatalf("self-recovered workload was delegated: outcome=%#v peers=%v", result.Outcomes[0], peers.endpoints)
 	}
 }
@@ -169,8 +313,8 @@ func TestPendingVerificationBlocksRedelegationAndResolvesOriginalIncident(t *tes
 	if len(second.Outcomes) != 1 || second.Outcomes[0].Status != "resolved" || second.Outcomes[0].Incident.ID != incident.ID {
 		t.Fatalf("resolved pending scan = %#v", second.Outcomes)
 	}
-	if len(peers.endpoints) != 0 {
-		t.Fatalf("resolved pending action caused new delegation: %v", peers.endpoints)
+	if len(peers.endpoints) != 1 || peers.kinds[0] != model.MessageIncidentReportRequest {
+		t.Fatalf("resolved pending action did not produce one report request: %v (%v)", peers.endpoints, peers.kinds)
 	}
 }
 
@@ -192,8 +336,8 @@ func TestPendingVerificationRunsWhenMetricQueryFails(t *testing.T) {
 	if _, pending := service.pending(key); pending {
 		t.Fatal("resolved pending verification was retained")
 	}
-	if len(peers.endpoints) != 0 {
-		t.Fatalf("metric failure caused delegation: %v", peers.endpoints)
+	if len(peers.endpoints) != 1 || peers.kinds[0] != model.MessageIncidentReportRequest {
+		t.Fatalf("metric failure changed the resolved incident workflow: %v (%v)", peers.endpoints, peers.kinds)
 	}
 }
 
@@ -256,11 +400,158 @@ func TestReceiptValidationBindsExactGrantAndDryRunSemantics(t *testing.T) {
 	}
 }
 
+func TestPostGrantUnverifiedOutcomesProduceSignedEscalationReport(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 30, 7, 35, 0, 0, time.UTC)
+	tests := []struct {
+		name              string
+		remediationErr    error
+		mismatchedReceipt bool
+	}{
+		{name: "expired grant", remediationErr: model.NewError(model.CodeGrantExpired, "grant expired at Operator")},
+		{name: "replayed grant", remediationErr: model.NewError(model.CodeReplayedGrant, "grant replay was not recoverable")},
+		{name: "execution error", remediationErr: model.NewError(model.CodeExecutionFailed, "action backend returned no receipt")},
+		{name: "transport failure", remediationErr: fmt.Errorf("operator connection reset")},
+		{name: "mismatched receipt", mismatchedReceipt: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tools := &monitorToolFake{now: now}
+			peers := &monitorPeerFake{
+				now: now, diagnosisStatus: model.DiagnosisConfirmed,
+				remediationErr: test.remediationErr, mismatchedReceipt: test.mismatchedReceipt,
+			}
+			service := monitorService(now, tools, peers)
+			service.VerificationCount = 1
+			privateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{42}, ed25519.SeedSize))
+			signer, err := security.NewSigner(privateKey, "monitor-action-test-key")
+			if err != nil {
+				t.Fatal(err)
+			}
+			service.Signer = signer
+			service.Policy = allowProposalPolicy{}
+
+			result, err := service.Scan(context.Background(), ScanRequest{})
+			if err != nil {
+				t.Fatalf("Scan() error = %v", err)
+			}
+			if len(result.Outcomes) != 1 {
+				t.Fatalf("outcomes = %#v, want one escalated incident", result.Outcomes)
+			}
+			outcome := result.Outcomes[0]
+			if outcome.Status != "escalated" || outcome.Incident.State != model.IncidentEscalated {
+				t.Fatalf("post-grant outcome = %#v, want terminal escalation", outcome)
+			}
+			if outcome.Grant == nil || outcome.Receipt != nil {
+				t.Fatalf("untrusted receipt was retained: grant=%#v receipt=%#v", outcome.Grant, outcome.Receipt)
+			}
+			if outcome.Report == nil || outcome.Report.Report.Reason != model.ReportReasonActionOutcomeUnverified {
+				t.Fatalf("post-grant failure report = %#v, want action_outcome_unverified", outcome.Report)
+			}
+			if peers.remediationCalls != 1 || len(peers.reportRequests) != 1 {
+				t.Fatalf("Operator calls = remediation %d, reports %d; want one each", peers.remediationCalls, len(peers.reportRequests))
+			}
+			request := peers.reportRequests[0]
+			if request.GrantID != "" || request.ReceiptID != "" {
+				t.Fatalf("failure report trusted an absent or malformed receipt: %#v", request)
+			}
+		})
+	}
+}
+
+func TestValidatedFailedReceiptProducesExactActionFailureReport(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 30, 7, 37, 0, 0, time.UTC)
+	tools := &monitorToolFake{now: now}
+	peers := &monitorPeerFake{
+		now: now, diagnosisStatus: model.DiagnosisConfirmed,
+		remediationOutcome: model.ActionFailed,
+	}
+	service := monitorService(now, tools, peers)
+	service.VerificationCount = 1
+	service.DryRun = false
+	privateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{44}, ed25519.SeedSize))
+	signer, err := security.NewSigner(privateKey, "monitor-failed-receipt-test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.Signer = signer
+	service.Policy = allowProposalPolicy{}
+
+	result, err := service.Scan(context.Background(), ScanRequest{})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if len(result.Outcomes) != 1 {
+		t.Fatalf("outcomes = %#v, want one failed incident", result.Outcomes)
+	}
+	outcome := result.Outcomes[0]
+	if outcome.Status != string(model.ActionFailed) || outcome.Incident.State != model.IncidentFailed || outcome.Receipt == nil {
+		t.Fatalf("validated failed receipt did not produce a failed incident: %#v", outcome)
+	}
+	if outcome.Report == nil || outcome.Report.Report.Reason != model.ReportReasonActionFailed || outcome.Report.Report.Execution == nil {
+		t.Fatalf("validated failed receipt did not produce an execution-backed action_failed report: %#v", outcome.Report)
+	}
+	execution := outcome.Report.Report.Execution
+	if execution.GrantID != outcome.Grant.GrantID || execution.ReceiptID != outcome.Receipt.ReceiptID ||
+		!execution.Action.Equal(outcome.Receipt.Action) || execution.Outcome != outcome.Receipt.Outcome ||
+		execution.DryRun != outcome.Receipt.DryRun || !execution.CompletedAt.Equal(outcome.Receipt.CompletedAt) {
+		t.Fatalf("action_failed report did not preserve the exact validated receipt: report=%#v receipt=%#v", execution, outcome.Receipt)
+	}
+}
+
+func TestMonitorRejectsReportFieldsNotAuthorizedBySignedRequest(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 30, 7, 40, 0, 0, time.UTC)
+	tests := []struct {
+		name           string
+		forgeExecution bool
+		forgeReportID  bool
+		forgeCreatedAt bool
+	}{
+		{name: "execution projection", forgeExecution: true},
+		{name: "report id", forgeReportID: true},
+		{name: "creation time", forgeCreatedAt: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tools := &monitorToolFake{now: now}
+			peers := &monitorPeerFake{
+				now: now, diagnosisStatus: model.DiagnosisConfirmed,
+				forgeReportExecution: test.forgeExecution,
+				forgeReportID:        test.forgeReportID,
+				forgeReportCreatedAt: test.forgeCreatedAt,
+			}
+			service := monitorService(now, tools, peers)
+			service.VerificationCount = 1
+			privateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{43}, ed25519.SeedSize))
+			signer, err := security.NewSigner(privateKey, "monitor-report-binding-test-key")
+			if err != nil {
+				t.Fatal(err)
+			}
+			service.Signer = signer
+			service.Policy = allowProposalPolicy{}
+
+			result, err := service.Scan(context.Background(), ScanRequest{})
+			if err != nil {
+				t.Fatalf("Scan() error = %v", err)
+			}
+			if len(result.Outcomes) != 1 {
+				t.Fatalf("outcomes = %#v, want one dry-run incident", result.Outcomes)
+			}
+			outcome := result.Outcomes[0]
+			if outcome.Report != nil || !strings.Contains(outcome.Detail, "incident report response was rejected") {
+				t.Fatalf("Monitor accepted report data absent from its signed request: %#v", outcome)
+			}
+		})
+	}
+}
+
 func remediatingIncident(t *testing.T, now time.Time, target model.ResourceTarget) model.Incident {
 	t.Helper()
 	incident, err := model.NewIncident("incident-pending", model.IncidentSignal{
 		ID: "signal-1", Source: "victoriametrics", RuleID: DefaultRules()[0].ID,
-		Fingerprint: fingerprint(DefaultRules()[0].ID, target.Namespace, target.Name),
+		Fingerprint: workloadFingerprint(target.Namespace, target.Name),
 		Summary:     "deployment unavailable", Severity: model.SeverityCritical,
 		ObservedAt: now, Labels: map[string]string{"namespace": target.Namespace, "deployment": target.Name},
 	}, now)
@@ -283,7 +574,7 @@ func installPendingVerification(t *testing.T, service *Service, now time.Time, a
 	target := model.ResourceTarget{APIVersion: "apps/v1", Kind: "Deployment", Namespace: "outage-arena", Name: "demo-api"}
 	startedAt := now.Add(-age)
 	incident := remediatingIncident(t, startedAt, target)
-	key := fingerprint(DefaultRules()[0].ID, target.Namespace, target.Name)
+	key := workloadFingerprint(target.Namespace, target.Name)
 	service.tracker = map[string]*observation{
 		key: {
 			Dispatched: startedAt,
@@ -297,11 +588,12 @@ func installPendingVerification(t *testing.T, service *Service, now time.Time, a
 					Action: model.ActionSpec{Kind: model.ActionRestartDeployment, Target: target},
 				},
 				Receipt: model.ActionReceipt{
-					GrantID: "grant-1", IncidentID: incident.ID,
+					ReceiptID: "receipt-1", GrantID: "grant-1", IncidentID: incident.ID,
 					Action:  model.ActionSpec{Kind: model.ActionRestartDeployment, Target: target},
 					Outcome: model.ActionSucceeded,
 				},
 				Target: target, StartedAt: startedAt,
+				CorrelationID: incident.ID, CausationID: "receipt-message-1",
 			},
 		},
 	}
@@ -309,9 +601,15 @@ func installPendingVerification(t *testing.T, service *Service, now time.Time, a
 }
 
 func monitorService(now time.Time, tools *monitorToolFake, peers *monitorPeerFake) *Service {
+	privateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{41}, ed25519.SeedSize))
+	signer, err := security.NewSigner(privateKey, "monitor-report-test-key")
+	if err != nil {
+		panic(err)
+	}
 	return &Service{
 		Tools: tools, Peers: peers, Clock: monitorClock{now: now}, IDs: &monitorIDs{},
-		Namespace: "outage-arena", InvestigatorURL: "http://investigator", OperatorURL: "http://operator",
+		ReportSigner: signer,
+		Namespace:    "outage-arena", InvestigatorURL: "http://investigator", OperatorURL: "http://operator",
 		Rules: DefaultRules(), VerificationCount: 2, Cooldown: time.Minute,
 		DelegationTTL: 2 * time.Minute, RequestTimeout: time.Second, EvidenceBudget: 4, DryRun: true,
 	}
@@ -321,12 +619,18 @@ type monitorToolFake struct {
 	now             time.Time
 	calls           []string
 	samples         []toolapi.MetricSample
+	logSamples      []toolapi.DetectionSample
+	traceSamples    []toolapi.DetectionSample
+	noDefaultMetric bool
 	healthySnapshot bool
 	metricErr       error
 }
 
 func (*monitorToolFake) Discover(context.Context) ([]string, error) {
-	return []string{toolapi.ToolQueryMetrics, toolapi.ToolGetWorkloadSnapshot}, nil
+	return []string{
+		toolapi.ToolQueryMetrics, toolapi.ToolQueryLogSignals,
+		toolapi.ToolQueryTraceSignals, toolapi.ToolGetWorkloadSnapshot,
+	}, nil
 }
 
 func (f *monitorToolFake) Call(_ context.Context, name string, input, output any) error {
@@ -347,7 +651,7 @@ func (f *monitorToolFake) Call(_ context.Context, name string, input, output any
 		result.TemplateID = request.TemplateID
 		result.ObservedAt = f.now
 		result.Samples = append([]toolapi.MetricSample(nil), f.samples...)
-		if len(result.Samples) == 0 {
+		if len(result.Samples) == 0 && !f.noDefaultMetric {
 			result.Samples = []toolapi.MetricSample{{
 				Labels:    map[string]string{"namespace": "outage-arena", "deployment": "demo-api"},
 				Timestamp: f.now, Value: 1,
@@ -375,6 +679,34 @@ func (f *monitorToolFake) Call(_ context.Context, name string, input, output any
 			result.Snapshot.UnavailableReplicas = 0
 		}
 		return nil
+	case toolapi.ToolQueryLogSignals:
+		request, ok := input.(toolapi.QueryLogSignalsInput)
+		if !ok {
+			return fmt.Errorf("unexpected log signal input %T", input)
+		}
+		result, ok := output.(*toolapi.QueryLogSignalsOutput)
+		if !ok {
+			return fmt.Errorf("unexpected log signal output %T", output)
+		}
+		result.TemplateID = request.TemplateID
+		result.WindowStart = f.now.Add(-5 * time.Minute)
+		result.WindowEnd = f.now
+		result.Samples = append([]toolapi.DetectionSample(nil), f.logSamples...)
+		return nil
+	case toolapi.ToolQueryTraceSignals:
+		request, ok := input.(toolapi.QueryTraceSignalsInput)
+		if !ok {
+			return fmt.Errorf("unexpected trace signal input %T", input)
+		}
+		result, ok := output.(*toolapi.QueryTraceSignalsOutput)
+		if !ok {
+			return fmt.Errorf("unexpected trace signal output %T", output)
+		}
+		result.TemplateID = request.TemplateID
+		result.WindowStart = f.now.Add(-5 * time.Minute)
+		result.WindowEnd = f.now
+		result.Samples = append([]toolapi.DetectionSample(nil), f.traceSamples...)
+		return nil
 	default:
 		return fmt.Errorf("unexpected tool %q", name)
 	}
@@ -393,15 +725,143 @@ func (f *monitorToolFake) count(name string) int {
 }
 
 type monitorPeerFake struct {
-	now             time.Time
-	diagnosisStatus model.DiagnosisStatus
-	endpoints       []string
+	now                  time.Time
+	diagnosisStatus      model.DiagnosisStatus
+	remediationErr       error
+	remediationOutcome   model.ActionOutcome
+	mismatchedReceipt    bool
+	remediationCalls     int
+	lastReceipt          *model.ActionReceipt
+	reportRequests       []model.IncidentReportRequest
+	forgeReportExecution bool
+	forgeReportID        bool
+	forgeReportCreatedAt bool
+	endpoints            []string
+	kinds                []model.MessageKind
 }
 
 func (f *monitorPeerFake) Send(_ context.Context, endpoint string, envelope model.Envelope, response any) error {
 	f.endpoints = append(f.endpoints, endpoint)
+	f.kinds = append(f.kinds, envelope.Kind)
+	if endpoint == "http://operator" {
+		if envelope.Kind == model.MessageRemediationRequest {
+			f.remediationCalls++
+			if f.remediationErr != nil {
+				return f.remediationErr
+			}
+			var grant model.DelegationGrant
+			if err := envelope.DecodePayload(&grant); err != nil {
+				return err
+			}
+			grantID := grant.GrantID
+			if f.mismatchedReceipt {
+				grantID = "different-grant"
+			}
+			outcome := f.remediationOutcome
+			if outcome == "" {
+				if grant.DryRun {
+					outcome = model.ActionDryRun
+				} else {
+					outcome = model.ActionSucceeded
+				}
+			}
+			receipt := model.ActionReceipt{
+				SchemaVersion: model.SchemaVersionV1, ReceiptID: "receipt-1",
+				GrantID: grantID, IncidentID: grant.IncidentID, Action: grant.Action,
+				Outcome: outcome, DryRun: grant.DryRun, StartedAt: f.now, CompletedAt: f.now,
+				AuditRef: "audit-1",
+			}
+			if outcome == model.ActionFailed || outcome == model.ActionRejected {
+				receipt.ErrorCode = model.CodeExecutionFailed
+				receipt.ErrorMessage = "bounded fixture action failure"
+			}
+			f.lastReceipt = &receipt
+			reply, err := model.NewEnvelope(
+				"receipt-message", grant.IncidentID, envelope.CorrelationID, envelope.MessageID,
+				model.AgentOperator, model.AgentMonitor, model.MessageActionReceipt, f.now, receipt,
+			)
+			if err != nil {
+				return err
+			}
+			destination, ok := response.(*model.Envelope)
+			if !ok {
+				return fmt.Errorf("unexpected peer response destination %T", response)
+			}
+			*destination = reply
+			return nil
+		}
+		if envelope.Kind != model.MessageIncidentReportRequest {
+			return fmt.Errorf("unexpected Operator message kind %q", envelope.Kind)
+		}
+		var request model.IncidentReportRequest
+		if err := envelope.DecodePayload(&request); err != nil {
+			return err
+		}
+		if err := request.ValidateSigned(); err != nil {
+			return fmt.Errorf("Monitor sent an unauthorized report request: %w", err)
+		}
+		f.reportRequests = append(f.reportRequests, request)
+		reportID, err := request.DeterministicReportID()
+		if err != nil {
+			return err
+		}
+		report := model.IncidentReport{
+			SchemaVersion: model.SchemaVersionV1, ReportID: reportID, RequestID: request.RequestID,
+			IncidentID: request.IncidentID, CorrelationID: request.CorrelationID,
+			DiagnosisReportID: request.DiagnosisReportID, Target: request.Target,
+			FinalState: request.FinalState, Reason: request.Reason, Summary: request.Reason.Summary(),
+			CreatedAt: request.RequestedAt,
+		}
+		if request.GrantID != "" && f.lastReceipt != nil {
+			report.Execution = &model.IncidentReportExecution{
+				GrantID: request.GrantID, ReceiptID: request.ReceiptID, Action: f.lastReceipt.Action,
+				Outcome: f.lastReceipt.Outcome, DryRun: f.lastReceipt.DryRun, CompletedAt: f.lastReceipt.CompletedAt,
+			}
+		}
+		if f.forgeReportID {
+			report.ReportID = "report-forged"
+		}
+		if f.forgeReportCreatedAt {
+			report.CreatedAt = request.RequestedAt.Add(time.Second)
+		}
+		if f.forgeReportExecution {
+			replicas := int32(2)
+			report.Execution = &model.IncidentReportExecution{
+				GrantID: request.GrantID, ReceiptID: request.ReceiptID,
+				Action: model.ActionSpec{
+					Kind: model.ActionScaleDeployment, Target: request.Target,
+					Parameters: model.ActionParameters{Replicas: &replicas},
+				},
+				Outcome: model.ActionDryRun, DryRun: true, CompletedAt: f.now,
+			}
+		}
+		if err := report.Seal(); err != nil {
+			return err
+		}
+		result := model.IncidentReportResult{
+			Report: report,
+			Notification: model.NotificationReceipt{
+				ReportID: report.ReportID, IdempotencyKey: report.RequestID,
+				Channel: model.NotificationChannelWhatsApp, Status: model.NotificationDelivered,
+				ProviderMessageID: "wamid.test", AttemptedAt: f.now,
+			},
+		}
+		reply, err := model.NewEnvelope(
+			"report-message", request.IncidentID, envelope.CorrelationID, envelope.MessageID,
+			model.AgentOperator, model.AgentMonitor, model.MessageIncidentReport, f.now, result,
+		)
+		if err != nil {
+			return err
+		}
+		destination, ok := response.(*model.Envelope)
+		if !ok {
+			return fmt.Errorf("unexpected peer response destination %T", response)
+		}
+		*destination = reply
+		return nil
+	}
 	if endpoint != "http://investigator" {
-		return fmt.Errorf("unexpected delegation endpoint %q", endpoint)
+		return fmt.Errorf("unexpected peer endpoint %q", endpoint)
 	}
 	var request model.InvestigationRequest
 	if err := envelope.DecodePayload(&request); err != nil {
@@ -438,6 +898,12 @@ func (f *monitorPeerFake) Send(_ context.Context, endpoint string, envelope mode
 	}
 	*destination = reply
 	return nil
+}
+
+type allowProposalPolicy struct{}
+
+func (allowProposalPolicy) AuthorizeProposal(model.DiagnosisReport, model.DelegationGrant, time.Time) model.PolicyDecision {
+	return model.Allow()
 }
 
 type monitorClock struct{ now time.Time }

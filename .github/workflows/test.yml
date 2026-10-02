@@ -33,6 +33,12 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: E2E control-plane workflow
+        shell: bash
+        run: |
+          test "$(go test -list '^TestE2E' ./internal/integration | grep -c '^TestE2E')" -ge 2
+          go test -count=1 -timeout=30s -run '^TestE2E' ./internal/integration
+
       - name: Vet
         run: go vet ./...
 

@@ -21,6 +21,24 @@
       }
     ]
   },
+  "log_signals": {
+    "log_error_burst_5m": [
+      {
+        "namespace": "outage-arena",
+        "workload": "demo-api",
+        "value": 8
+      }
+    ]
+  },
+  "trace_signals": {
+    "trace_error_count_5m": [
+      {
+        "namespace": "outage-arena",
+        "workload": "demo-api",
+        "value": 4
+      }
+    ]
+  },
   "snapshot": {
     "target": {
       "api_version": "apps/v1",
@@ -80,4 +98,3 @@
     }
   ]
 }
-

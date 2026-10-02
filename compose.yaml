@@ -8,6 +8,7 @@ x-aegis-environment: &aegis-environment
   AEGIS_FIXTURE_PATH: /fixtures/unavailable-deployment.json
   AEGIS_DRY_RUN: "${AEGIS_DRY_RUN:-true}"
   AEGIS_ALLOW_MUTATIONS: "${AEGIS_ALLOW_MUTATIONS:-false}"
+  AEGIS_ALLOW_LOG_TRACE_ACTIONS: "${AEGIS_ALLOW_LOG_TRACE_ACTIONS:-false}"
   AEGIS_SCAN_INTERVAL: "${AEGIS_SCAN_INTERVAL:-5s}"
   AEGIS_VERIFICATION_COUNT: "${AEGIS_VERIFICATION_COUNT:-2}"
   AEGIS_INCIDENT_COOLDOWN: "${AEGIS_INCIDENT_COOLDOWN:-1m}"
@@ -18,10 +19,14 @@ x-aegis-environment: &aegis-environment
   AEGIS_MAX_SCALE_REPLICAS: "${AEGIS_MAX_SCALE_REPLICAS:-20}"
   AEGIS_MAX_SCALE_INCREASE: "${AEGIS_MAX_SCALE_INCREASE:-5}"
   AEGIS_DELEGATION_KEY_ID: "${AEGIS_DELEGATION_KEY_ID:-aegissre-monitor-v1}"
+  AEGIS_LOG_LEVEL: "${AEGIS_LOG_LEVEL:-info}"
   AEGIS_OBSERVE_MCP_URL: http://aegis-mcp-read:8080/mcp
   AEGIS_OPERATE_MCP_URL: http://aegis-mcp-action:8080/mcp
   AEGIS_INVESTIGATOR_URL: http://aegis-investigator:8080
   AEGIS_OPERATOR_URL: http://aegis-operator:8080
+  AEGIS_VICTORIA_METRICS_URL: "${AEGIS_VICTORIA_METRICS_URL:-http://vmsingle.observability.svc.cluster.local:8428}"
+  AEGIS_VICTORIA_LOGS_URL: "${AEGIS_VICTORIA_LOGS_URL:-http://vlogs.observability.svc.cluster.local:9428}"
+  AEGIS_VICTORIA_TRACES_URL: "${AEGIS_VICTORIA_TRACES_URL:-http://vtraces.observability.svc.cluster.local:10428}"
 
 x-aegis-service: &aegis-service
   build:
@@ -88,6 +93,14 @@ services:
       <<: *aegis-environment
       AEGIS_PUBLIC_URL: http://aegis-operator:8080
       AEGIS_DELEGATION_PUBLIC_KEY: "${AEGIS_DELEGATION_PUBLIC_KEY:-}"
+      AEGIS_WHATSAPP_ENABLED: "${AEGIS_WHATSAPP_ENABLED:-false}"
+      AEGIS_WHATSAPP_GRAPH_VERSION: "${AEGIS_WHATSAPP_GRAPH_VERSION:-}"
+      AEGIS_WHATSAPP_PHONE_NUMBER_ID: "${AEGIS_WHATSAPP_PHONE_NUMBER_ID:-}"
+      AEGIS_WHATSAPP_ACCESS_TOKEN: "${AEGIS_WHATSAPP_ACCESS_TOKEN:-}"
+      AEGIS_WHATSAPP_RECIPIENT: "${AEGIS_WHATSAPP_RECIPIENT:-}"
+      AEGIS_WHATSAPP_TEMPLATE: "${AEGIS_WHATSAPP_TEMPLATE:-aegissre_incident_update}"
+      AEGIS_WHATSAPP_LANGUAGE: "${AEGIS_WHATSAPP_LANGUAGE:-en_US}"
+      AEGIS_WHATSAPP_MAX_RETRIES: "${AEGIS_WHATSAPP_MAX_RETRIES:-2}"
     networks: [control, operate]
     ports:
       - "127.0.0.1:8083:8080"

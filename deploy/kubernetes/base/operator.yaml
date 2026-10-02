@@ -44,6 +44,24 @@ spec:
                   name: aegis-delegation-keys
                   key: public-key
                   optional: true
+            - name: AEGIS_WHATSAPP_PHONE_NUMBER_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aegis-whatsapp
+                  key: phone-number-id
+                  optional: true
+            - name: AEGIS_WHATSAPP_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: aegis-whatsapp
+                  key: access-token
+                  optional: true
+            - name: AEGIS_WHATSAPP_RECIPIENT
+              valueFrom:
+                secretKeyRef:
+                  name: aegis-whatsapp
+                  key: recipient
+                  optional: true
           ports:
             - name: http
               containerPort: 8080

@@ -2,11 +2,11 @@
 
 Autonomous reliability with bounded authority.
 
-AegisSRE is a three-agent reliability system for Kubernetes. Monitor detects and verifies an incident, Investigator builds an evidence-backed diagnosis, and Operator performs only a narrowly delegated action. Agents coordinate over the official [Agent2Agent (A2A) Protocol v1.0](https://a2a-protocol.org/v1.0.0/specification); tools are exposed over the official [Model Context Protocol (MCP) 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) using stateless Streamable HTTP.
+AegisSRE is a three-agent reliability system for Kubernetes. Monitor detects and verifies incidents across metrics, logs, and traces; Investigator builds an evidence-backed diagnosis and exact action proposal; Operator performs only a narrowly delegated action, returns its receipt for independent verification, then creates the terminal incident report and can deliver it through WhatsApp. Agents coordinate over the official [Agent2Agent (A2A) Protocol v1.0](https://a2a-protocol.org/v1.0.0/specification); tools are exposed over the official [Model Context Protocol (MCP) 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) using stateless Streamable HTTP.
 
 The safety boundary is deliberate: diagnosis does not imply permission, and permission does not imply execution. Live mutations require a short-lived, incident-bound Ed25519 delegation that both Operator and the action MCP server validate independently. Dry-run is the default.
 
-> **Project status:** pre-release. The executable, three agent services, two MCP profiles, fixture/Victoria/Kubernetes adapters, A2A/MCP transports, Compose topology, and Kustomize manifests are implemented. An integration test exercises the fixture path across MCP and A2A through signed, independently verified dry-run delegation. This is not yet a production incident-response system: live k3s/Victoria integration, independent protocol conformance, durable shared incident/replay/audit state, authenticated transport and TLS, key rotation, OTLP export, and workload-specific policy remain to be implemented or validated before use.
+> **Project status:** pre-release. The executable, three agent services, two MCP profiles, fixture/Victoria/Kubernetes adapters, A2A/MCP transports, terminal reporting, opt-in WhatsApp adapter, Compose topology, and Kustomize manifests are implemented. Deterministic control-plane E2E tests cross real MCP, A2A, and notification HTTP boundaries for both a signed live fixture recovery and an outside-authority escalation; the default dry-run path is tested separately. This is not a separate-process or live-k3s E2E claim. Live k3s telemetry schemas, WhatsApp credentials/templates and egress, independent protocol conformance, durable shared incident/replay/report state, authenticated transport and TLS, key rotation, OTLP export, and workload-specific policy remain to be implemented or validated before use.
 
 ## System shape
 
@@ -34,10 +34,10 @@ The safety boundary is deliberate: diagnosis does not imply permission, and perm
 
 | Component | Responsibility | Authority |
 |---|---|---|
-| Monitor | Detects a candidate incident, verifies it, requests investigation, evaluates the result, issues a bounded grant, and verifies recovery | Read-only evidence plus the grant-signing key; no Kubernetes write credential |
-| Investigator | Collects bounded evidence and returns a diagnosis with confidence, supporting evidence, and a proposed action | Observe MCP only; cannot sign a grant or mutate infrastructure |
-| Operator | Validates a grant, requests the exact authorized action, and reports the result | Action MCP client only; no direct Kubernetes credential |
-| Observe MCP | Provides allowlisted metrics, logs, workload snapshots, and bounded pod logs | Read-only telemetry and Kubernetes access |
+| Monitor | Detects metric/log/trace candidates, verifies them, requests investigation, evaluates the result, issues a bounded grant, and independently verifies recovery | Read-only evidence plus the grant-signing key; no Kubernetes write credential |
+| Investigator | Collects bounded multi-signal evidence and returns a diagnosis with confidence, supporting evidence, and an exact proposed action | Observe MCP only; cannot sign a grant or mutate infrastructure |
+| Operator | Validates a grant, requests the exact authorized action, returns its receipt, and creates/notifies a sanitized report for Monitor-declared terminal states | Action MCP client and optional WhatsApp token; no direct Kubernetes credential |
+| Observe MCP | Provides allowlisted metric, log, and trace templates plus workload snapshots and bounded pod logs | Read-only telemetry and Kubernetes access |
 | Action MCP | Revalidates the grant and performs one allowlisted operation | Minimal namespace-scoped Kubernetes write access |
 
 The two MCP planes must be independently addressable and independently authorized. Combining their credentials defeats the privilege boundary even if they share a binary or container image.
@@ -59,6 +59,8 @@ The typed contracts live under `internal/toolapi`. The initial bounded catalog i
 **Observe plane**
 
 - `metrics_query_template` — selects a server-owned metric template; callers cannot submit arbitrary PromQL.
+- `logs_query_template` — counts only server-owned, five-minute structured-log signals grouped by an exact namespace/workload identity.
+- `traces_query_template` — counts only server-owned, five-minute trace signals grouped by an exact namespace/workload identity.
 - `logs_search` — searches within namespace, lookback, and result-size limits.
 - `k8s_get_workload_snapshot` — returns a bounded workload, pod, and event snapshot.
 - `k8s_get_pod_logs` — returns capped current or previous container logs.
@@ -74,7 +76,7 @@ There is intentionally no raw shell, `exec`, arbitrary query, generic patch, gen
 
 Investigator uses the deterministic heuristic reasoner by default. Setting all three of `AEGIS_LLM_BASE_URL`, `AEGIS_LLM_API_KEY`, and `AEGIS_LLM_MODEL` enables the optional Responses API reasoner as the primary. Provider errors, invalid responses, and rejected structured output fall back to the deterministic reasoner; a valid but inconclusive provider diagnosis is preserved rather than replaced.
 
-Model output remains untrusted. The adapter uses a strict JSON schema, accepts only evidence IDs gathered by the current investigation, and binds every proposal to the trusted target supplied by Monitor. In Kubernetes, the base NetworkPolicy blocks external model egress. Enabling a provider therefore also requires an explicit, narrowly scoped egress overlay; none is included by default.
+Model output remains untrusted. The adapter uses a strict JSON schema, accepts only evidence IDs gathered by the current investigation, and binds every proposal to the trusted target supplied by Monitor. Raw payloads from `logs_search` and `k8s_get_pod_logs` never enter the external prompt: only their provenance metadata and a fixed redaction marker are projected, while the original sealed evidence remains available to the local deterministic reasoner. In Kubernetes, the base NetworkPolicy blocks external model egress. Enabling a provider therefore also requires an explicit, narrowly scoped egress overlay; none is included by default.
 
 ## Quick start
 
@@ -89,6 +91,7 @@ git clone https://github.com/shanurwan/AegisSRE.git
 cd AegisSRE
 cp .env.example .env
 go test ./...
+make test-e2e
 ```
 
 The command surface is one binary with the following service modes:
@@ -119,10 +122,10 @@ The target k3s environment exposes these telemetry endpoints:
 |---|---|---|
 | Metrics | `http://vmsingle.observability.svc.cluster.local:8428` | VictoriaMetrics; Prometheus-compatible query API, 30-day retention in the current arena configuration |
 | Logs | `http://vlogs.observability.svc.cluster.local:9428` | VictoriaLogs; cluster pod logs, 14-day retention |
-| Traces | `http://vtraces.observability.svc.cluster.local:10428/select/jaeger` | VictoriaTraces through its Jaeger query API, 7-day retention |
+| Traces | `http://vtraces.observability.svc.cluster.local:10428` | VictoriaTraces; AegisSRE appends the bounded LogsQL stats API path, 7-day retention |
 | OTLP | `http://otel-collector.observability.svc.cluster.local:4318` | HTTP OTLP ingress; gRPC is available on port `4317` |
 
-The current read MCP consumes VictoriaMetrics and VictoriaLogs. VictoriaTraces query support and AegisSRE's own OTLP export are not wired.
+The read MCP consumes VictoriaMetrics, VictoriaLogs, and VictoriaTraces. Log detection requires the canonical `aegissre.io/workload` pod label in the collected stream, and trace detection requires `k8s.namespace.name` plus `k8s.deployment.name` resource attributes. Missing or mismatched identity fails closed. The arena's current collector does not add those trace attributes, so validate/enrich its OTEL pipeline before relying on trace incidents. AegisSRE's own OTLP export is not wired.
 
 The arena currently has no workload scenarios or alert rules under `apps/laboratory`; AegisSRE must not imply otherwise. Deployment also requires infra-owned read RBAC for cluster evidence and a separate, minimal action Role in `outage-arena`. Details are in [deployment](docs/deployment.md).
 
@@ -130,11 +133,15 @@ The arena currently has no workload scenarios or alert rules under `apps/laborat
 
 - Dry-run is on unless explicitly disabled.
 - Live Operator execution is separately disabled by default.
-- Only allowlisted namespaces, actions, metric templates, and bounded log queries are accepted.
+- Log- and trace-triggered incidents are detected and investigated, but cannot authorize a live mutation unless `AEGIS_ALLOW_LOG_TRACE_ACTIONS=true`; keep it false until workload identity is collector-owned and verified.
+- Only allowlisted namespaces, actions, metric/log/trace templates, and bounded log searches are accepted.
 - Grants are incident-bound, audience-bound, exact-parameter-bound, short-lived, and replay-protected.
 - `AEGIS_DELEGATION_KEY_ID` must identify the same key on Monitor, Operator, and action MCP; the default is `aegissre-monitor-v1`.
 - A scale request must strictly increase the signed expected replica count; no-op scaling and scale-down are denied. Defaults cap the request at 20 total replicas and the increase at 5, controlled by `AEGIS_MAX_SCALE_REPLICAS` and `AEGIS_MAX_SCALE_INCREASE`.
 - Operator and action MCP validate every grant independently.
+- Investigator defines the bounded action intent; only Monitor delegates authority. A proposal alone can never reach the action MCP.
+- Monitor authorizes every terminal report request with a distinct, short-lived Ed25519 signature; Operator verifies it before report creation or notification, so an A2A sender claim alone cannot trigger WhatsApp.
+- Every resolved, escalated, or failed terminal outcome is eligible for a non-authoritative Operator report, including rejected actions, validated action failures, and action outcomes that could not be verified. Ambiguous post-delegation outcomes escalate instead of being mislabeled as failures. WhatsApp delivery status is separate from incident state, so notification failure cannot rewrite the reliability result.
 - The Monitor signing key is never mounted in Investigator, Operator, or either Kubernetes tool plane.
 - Implemented investigation, authorization, and action paths emit structured audit events to JSON process logs; a durable append-only audit sink and full decision coverage remain production work.
 - Before delegation, a fresh healthy snapshot resolves the incident without action. After a successful live action, Monitor observes immediately; if the target is not yet healthy, the same incident remains `verification_pending` and scheduled scans retry observation without retrying the action. It resolves on recovery or escalates when the `AEGIS_INCIDENT_COOLDOWN` verification window elapses.

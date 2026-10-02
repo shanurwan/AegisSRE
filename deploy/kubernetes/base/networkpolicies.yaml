@@ -204,3 +204,5 @@ spec:
           port: 8428
         - protocol: TCP
           port: 9428
+        - protocol: TCP
+          port: 10428

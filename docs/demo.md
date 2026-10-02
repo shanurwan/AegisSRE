@@ -8,11 +8,12 @@ The fixture demo exercises the same application and transport boundaries as a cl
 Monitor -> Investigator -> read MCP -> fixture evidence
 Monitor -> signed delegation -> Operator -> action MCP -> fixture action receipt
 Monitor -> read MCP -> post-action verification (successful live action only)
+Monitor -> terminal report request -> Operator -> notification receipt
 ```
 
 It demonstrates process composition, bounded tools, structured agent messages, grant validation, dry-run behavior, and audit correlation. The repository integration test exercises the same fixture path in-process across real MCP and A2A HTTP transports.
 
-It does **not** prove Kubernetes RBAC, NetworkPolicy enforcement, production identity/TLS, distributed replay protection, live Victoria schemas, safe workload-specific remediation, or protocol conformance.
+It does **not** prove Kubernetes RBAC, NetworkPolicy enforcement, production identity/TLS, distributed replay/outbox protection, live Victoria schemas, Meta credentials/template approval or egress, safe workload-specific remediation, or protocol conformance.
 
 ## Safe defaults
 
@@ -24,6 +25,7 @@ AEGIS_DRY_RUN=true
 AEGIS_ALLOW_MUTATIONS=false
 AEGIS_DELEGATION_PRIVATE_KEY=
 AEGIS_DELEGATION_PUBLIC_KEY=
+AEGIS_WHATSAPP_ENABLED=false
 ```
 
 Without a keypair, Monitor may detect and investigate but cannot issue a valid action delegation. Adding keys exercises authorization; it does not turn off dry-run.
@@ -88,6 +90,7 @@ Expected safety properties:
 - evidence and diagnosis share one incident/correlation context;
 - no delegation is emitted because Monitor has no private key;
 - action MCP performs no mutation;
+- Operator creates an authority-escalation report; its notification receipt is `failed` while the notifier is deliberately disabled;
 - the no-key outcome is visible in the Monitor's structured JSON log.
 
 The exact log text is not an API. Confirm structured fields and process exit status rather than matching prose.
@@ -171,6 +174,7 @@ Now expect the delegation path to run, while the action remains a fixture/dry-ru
 4. the receipt says dry-run/no persistent side effect;
 5. a replay returns a cached/recovered result or a denial rather than performing a second action;
 6. Monitor escalates the dry-run outcome without inferring recovery; only a successful live action triggers immediate post-action observation, followed by scheduled read-only observations if verification remains pending.
+7. Monitor requests the terminal report from Operator; the report remains valid even though local WhatsApp delivery is disabled.
 
 Delete the disposable keys from `.env` after the exercise. Never use demo keys in k3s.
 
@@ -190,8 +194,9 @@ These cases are more important than the happy path. Exercise them through tests 
 | Reused grant ID | Cached/recovered result or replay denial; no second mutation |
 | Changed resource precondition | Conflict; request a new investigation |
 | Read MCP unavailable during detection | Detection fails and is retried on the next interval; no new candidate incident is queued |
-| Action MCP unavailable after grant | Incident becomes failed and the fingerprint enters cooldown; action result may require manual verification |
+| Action MCP response unavailable or unverifiable after grant | Incident becomes terminal `escalated` with `action_outcome_unverified` and the fingerprint enters cooldown; the action result requires manual verification, while `failed` is reserved for a validated failed/rolled-back receipt |
 | Verification remains unhealthy or unreadable | Same incident remains `verification_pending` and blocks redelegation; scheduled scans retry observation only, then escalate it when the cooldown-length window expires |
+| WhatsApp disabled/unreachable | Terminal report is still returned; notification status is failed and incident state is unchanged |
 
 ## Inspect the MCP catalog
 
@@ -199,6 +204,8 @@ The authoritative catalog is the result of MCP `tools/list`. The read server exp
 
 ```text
 metrics_query_template
+logs_query_template
+traces_query_template
 logs_search
 k8s_get_workload_snapshot
 k8s_get_pod_logs
@@ -227,10 +234,16 @@ The fixture demo is successful when:
 - dry-run does not infer recovery, and the fixture remains unchanged;
 - all processes stop cleanly.
 
-The automated integration check for the transport-spanning dry-run path is:
+The default-safe dry-run integration check is:
 
 ```bash
 go test ./internal/integration -run TestFixtureIncidentFlowsAcrossMCPAndA2A
 ```
 
-Passing this test does not validate Docker networking, a deployed cluster, live Victoria schemas, Kubernetes RBAC/NetworkPolicy enforcement, or production identity.
+The dedicated deterministic control-plane E2E gate crosses real MCP, A2A, and notification HTTP boundaries. It proves a signed live fixture remediation followed by independent recovery verification and WhatsApp delivery, plus an outside-authority escalation that performs zero action calls:
+
+```bash
+make test-e2e
+```
+
+Passing these tests does not validate separate-process Docker networking, a deployed cluster, live Victoria schemas, Kubernetes RBAC/NetworkPolicy enforcement, or production workload identity.

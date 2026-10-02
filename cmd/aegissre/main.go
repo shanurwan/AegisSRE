@@ -22,6 +22,7 @@ import (
 	"github.com/shanurwan/AegisSRE/internal/adapters/backend"
 	"github.com/shanurwan/AegisSRE/internal/adapters/fixture"
 	kubeadapter "github.com/shanurwan/AegisSRE/internal/adapters/kubernetes"
+	notificationadapter "github.com/shanurwan/AegisSRE/internal/adapters/notification"
 	reasoneradapter "github.com/shanurwan/AegisSRE/internal/adapters/reasoner"
 	"github.com/shanurwan/AegisSRE/internal/adapters/telemetry"
 	"github.com/shanurwan/AegisSRE/internal/app/investigator"
@@ -184,13 +185,15 @@ func runMonitor(ctx context.Context, cfg config.Config, logger *slog.Logger) err
 		return err
 	}
 	service := &monitor.Service{
-		Tools: tools, Peers: a2atransport.NewClient(cfg.RequestTimeout), Signer: signer,
+		Tools: tools, Peers: a2atransport.NewClient(cfg.RequestTimeout),
+		Signer: signer, ReportSigner: signer,
 		Policy: policy,
 		Clock:  clock, IDs: ids, Audit: audit.Logger{Log: logger}, Namespace: cfg.AllowedNamespace,
 		InvestigatorURL: cfg.InvestigatorURL, OperatorURL: cfg.OperatorURL,
 		Rules: monitor.DefaultRules(), VerificationCount: cfg.VerificationCount,
 		Cooldown: cfg.IncidentCooldown, DelegationTTL: cfg.DelegationTTL,
 		RequestTimeout: cfg.RequestTimeout, EvidenceBudget: cfg.EvidenceBudget, DryRun: cfg.DryRun,
+		AllowLogTraceActions: cfg.AllowLogTraceActions,
 	}
 	handler, _, err := a2atransport.NewHandler(a2atransport.CardConfig{
 		Name: "AegisSRE Monitor", Description: "Autonomously detects and verifies bounded reliability incidents",
@@ -222,6 +225,14 @@ func monitorLoop(ctx context.Context, service *monitor.Service, interval time.Du
 			logger.InfoContext(ctx, "incident outcome",
 				"incident_id", outcome.Incident.ID, "status", outcome.Status, "detail", outcome.Detail,
 			)
+			if outcome.Report != nil {
+				logger.InfoContext(ctx, "incident report outcome",
+					"incident_id", outcome.Incident.ID,
+					"report_id", outcome.Report.Report.ReportID,
+					"notification_channel", outcome.Report.Notification.Channel,
+					"notification_status", outcome.Report.Notification.Status,
+				)
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -281,9 +292,23 @@ func runOperator(ctx context.Context, cfg config.Config, logger *slog.Logger) er
 	if err != nil {
 		return err
 	}
+	var notifier ports.Notifier
+	if cfg.WhatsAppEnabled {
+		notifier, err = notificationadapter.NewWhatsApp(notificationadapter.Config{
+			GraphVersion: cfg.WhatsAppGraphVersion, PhoneNumberID: cfg.WhatsAppPhoneID,
+			AccessToken: cfg.WhatsAppAccessToken, Recipient: cfg.WhatsAppRecipient,
+			Template: cfg.WhatsAppTemplate, Language: cfg.WhatsAppLanguage,
+			MaxRetries: cfg.WhatsAppMaxRetries, Client: httpclient.External(cfg.RequestTimeout),
+		})
+		if err != nil {
+			return fmt.Errorf("configure WhatsApp notifier: %w", err)
+		}
+		logger.Info("WhatsApp incident report delivery enabled", "template", cfg.WhatsAppTemplate, "graph_version", cfg.WhatsAppGraphVersion)
+	}
 	service := &operator.Service{
-		Tools: tools, Verifier: verifier, Policy: policy, Replay: security.NewMemoryReplayGuard(),
-		Clock: clock, IDs: ids, Audit: audit.Logger{Log: logger},
+		Tools: tools, Verifier: verifier, ReportVerifier: verifier,
+		Policy: policy, Replay: security.NewMemoryReplayGuard(),
+		Clock: clock, IDs: ids, Audit: audit.Logger{Log: logger}, Notifier: notifier,
 	}
 	handler, _, err := a2atransport.NewHandler(a2atransport.CardConfig{
 		Name: "AegisSRE Operator", Description: "Executes only exact, signed, policy-approved remediation delegations",
@@ -329,7 +354,8 @@ func observeBackend(cfg config.Config) (ports.ObserveBackend, error) {
 		return nil, err
 	}
 	telemetryBackend := &telemetry.Victoria{
-		MetricsURL: cfg.VictoriaMetricsURL, LogsURL: cfg.VictoriaLogsURL, Namespace: cfg.AllowedNamespace,
+		MetricsURL: cfg.VictoriaMetricsURL, LogsURL: cfg.VictoriaLogsURL,
+		TracesURL: cfg.VictoriaTracesURL, Namespace: cfg.AllowedNamespace,
 		Client: httpclient.Direct(cfg.RequestTimeout),
 	}
 	return backend.Observe{Telemetry: telemetryBackend, Kubernetes: kube}, nil
@@ -375,7 +401,12 @@ func actionPolicy(cfg config.Config) (*security.Policy, error) {
 	})
 }
 
-func monitorSigner(cfg config.Config) (ports.GrantSigner, error) {
+type monitorAuthorizationSigner interface {
+	ports.GrantSigner
+	ports.ReportRequestSigner
+}
+
+func monitorSigner(cfg config.Config) (monitorAuthorizationSigner, error) {
 	if strings.TrimSpace(cfg.DelegationPrivateKey) == "" {
 		return nil, nil
 	}
@@ -386,7 +417,12 @@ func monitorSigner(cfg config.Config) (ports.GrantSigner, error) {
 	return security.NewSigner(key, cfg.DelegationKeyID)
 }
 
-func grantVerifier(cfg config.Config, audience model.AgentID) (ports.GrantVerifier, error) {
+type authorizationVerifier interface {
+	ports.GrantVerifier
+	ports.ReportRequestVerifier
+}
+
+func grantVerifier(cfg config.Config, audience model.AgentID) (authorizationVerifier, error) {
 	if strings.TrimSpace(cfg.DelegationPublicKey) == "" {
 		return disabledVerifier{}, nil
 	}
@@ -400,6 +436,10 @@ func grantVerifier(cfg config.Config, audience model.AgentID) (ports.GrantVerifi
 type disabledVerifier struct{}
 
 func (disabledVerifier) Verify(model.DelegationGrant, time.Time) error {
+	return model.NewError(model.CodeDelegationRequired, "delegation public key is not configured")
+}
+
+func (disabledVerifier) VerifyReportRequest(model.IncidentReportRequest, time.Time) error {
 	return model.NewError(model.CodeDelegationRequired, "delegation public key is not configured")
 }
 
@@ -441,8 +481,10 @@ func readToolNames() []string {
 	return []string{
 		toolapi.ToolGetPodLogs,
 		toolapi.ToolGetWorkloadSnapshot,
+		toolapi.ToolQueryLogSignals,
 		toolapi.ToolSearchLogs,
 		toolapi.ToolQueryMetrics,
+		toolapi.ToolQueryTraceSignals,
 	}
 }
 

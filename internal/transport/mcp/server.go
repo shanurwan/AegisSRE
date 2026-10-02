@@ -19,6 +19,20 @@ func NewReadServer(backend ports.ObserveBackend) *mcp.Server {
 		return nil, output, err
 	})
 	mcp.AddTool(server, &mcp.Tool{
+		Name:        toolapi.ToolQueryLogSignals,
+		Description: "Run one bounded, server-owned namespaced log detection template. This tool cannot accept raw LogsQL, search text, time ranges, or thresholds.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input toolapi.QueryLogSignalsInput) (*mcp.CallToolResult, toolapi.QueryLogSignalsOutput, error) {
+		output, err := backend.QueryLogSignals(ctx, input)
+		return nil, output, err
+	})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        toolapi.ToolQueryTraceSignals,
+		Description: "Run one bounded, server-owned namespaced trace detection template. This tool cannot accept raw LogsQL, TraceQL, tags, time ranges, or thresholds.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input toolapi.QueryTraceSignalsInput) (*mcp.CallToolResult, toolapi.QueryTraceSignalsOutput, error) {
+		output, err := backend.QueryTraceSignals(ctx, input)
+		return nil, output, err
+	})
+	mcp.AddTool(server, &mcp.Tool{
 		Name:        toolapi.ToolSearchLogs,
 		Description: "Search a bounded time window of namespaced pod logs. This tool is read-only and caps rows, bytes, and lookback.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input toolapi.SearchLogsInput) (*mcp.CallToolResult, toolapi.SearchLogsOutput, error) {

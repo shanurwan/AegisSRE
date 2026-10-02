@@ -9,6 +9,8 @@ import (
 
 const (
 	ToolQueryMetrics         = "metrics_query_template"
+	ToolQueryLogSignals      = "logs_query_template"
+	ToolQueryTraceSignals    = "traces_query_template"
 	ToolSearchLogs           = "logs_search"
 	ToolGetWorkloadSnapshot  = "k8s_get_workload_snapshot"
 	ToolGetPodLogs           = "k8s_get_pod_logs"
@@ -22,6 +24,13 @@ const (
 	MetricPodCrashLoop          = "pod_crashloop"
 	MetricContainerRestarts     = "container_restarts_5m"
 	MetricPodNotReady           = "pod_not_ready"
+)
+
+const (
+	LogErrorBurst5m             = "log_error_burst_5m"
+	LogDependencyTimeoutBurst5m = "log_dependency_timeout_burst_5m"
+	TraceErrorCount5m           = "trace_error_count_5m"
+	TraceSlowServerCount5m      = "trace_slow_server_count_5m"
 )
 
 type QueryMetricsInput struct {
@@ -41,6 +50,41 @@ type QueryMetricsOutput struct {
 	Query      string         `json:"query"`
 	Samples    []MetricSample `json:"samples"`
 	ObservedAt time.Time      `json:"observed_at"`
+}
+
+// DetectionSample is the normalized result shared by server-owned log and
+// trace detection templates. Workload always names a Deployment in Namespace.
+type DetectionSample struct {
+	Namespace string    `json:"namespace"`
+	Workload  string    `json:"workload"`
+	Timestamp time.Time `json:"timestamp"`
+	Value     float64   `json:"value"`
+}
+
+type QueryLogSignalsInput struct {
+	TemplateID string `json:"template_id" jsonschema:"one of the advertised bounded log detection templates"`
+	Namespace  string `json:"namespace" jsonschema:"Kubernetes namespace"`
+	Workload   string `json:"workload,omitempty" jsonschema:"optional deployment name"`
+}
+
+type QueryLogSignalsOutput struct {
+	TemplateID  string            `json:"template_id"`
+	WindowStart time.Time         `json:"window_start"`
+	WindowEnd   time.Time         `json:"window_end"`
+	Samples     []DetectionSample `json:"samples"`
+}
+
+type QueryTraceSignalsInput struct {
+	TemplateID string `json:"template_id" jsonschema:"one of the advertised bounded trace detection templates"`
+	Namespace  string `json:"namespace" jsonschema:"Kubernetes namespace"`
+	Workload   string `json:"workload,omitempty" jsonschema:"optional deployment name"`
+}
+
+type QueryTraceSignalsOutput struct {
+	TemplateID  string            `json:"template_id"`
+	WindowStart time.Time         `json:"window_start"`
+	WindowEnd   time.Time         `json:"window_end"`
+	Samples     []DetectionSample `json:"samples"`
 }
 
 type SearchLogsInput struct {

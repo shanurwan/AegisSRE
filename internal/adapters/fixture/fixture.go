@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -15,10 +17,12 @@ import (
 )
 
 type Data struct {
-	Metrics  map[string][]toolapi.MetricSample `json:"metrics"`
-	Snapshot toolapi.WorkloadSnapshot          `json:"snapshot"`
-	PodLogs  map[string]string                 `json:"pod_logs"`
-	Logs     []toolapi.LogLine                 `json:"logs"`
+	Metrics      map[string][]toolapi.MetricSample    `json:"metrics"`
+	LogSignals   map[string][]toolapi.DetectionSample `json:"log_signals,omitempty"`
+	TraceSignals map[string][]toolapi.DetectionSample `json:"trace_signals,omitempty"`
+	Snapshot     toolapi.WorkloadSnapshot             `json:"snapshot"`
+	PodLogs      map[string]string                    `json:"pod_logs"`
+	Logs         []toolapi.LogLine                    `json:"logs"`
 }
 
 type Backend struct {
@@ -33,6 +37,8 @@ type Backend struct {
 	receipts       map[string]model.ActionReceipt
 	applied        map[string]bool
 }
+
+const maxFixtureDetectionCount = 1<<53 - 1
 
 func Load(path string) (*Backend, error) {
 	contents, err := os.ReadFile(path)
@@ -64,6 +70,94 @@ func (b *Backend) QueryMetrics(_ context.Context, input toolapi.QueryMetricsInpu
 		TemplateID: input.TemplateID, Query: "fixture:" + input.TemplateID,
 		Samples: copySamples, ObservedAt: b.now(),
 	}, nil
+}
+
+func (b *Backend) QueryLogSignals(_ context.Context, input toolapi.QueryLogSignalsInput) (toolapi.QueryLogSignalsOutput, error) {
+	if !validLogTemplate(input.TemplateID) {
+		return toolapi.QueryLogSignalsOutput{}, fmt.Errorf("unsupported log detection template %q", input.TemplateID)
+	}
+	start, end, samples, err := b.queryDetectionSignals(input.TemplateID, input.Namespace, input.Workload, b.data.LogSignals)
+	if err != nil {
+		return toolapi.QueryLogSignalsOutput{}, err
+	}
+	return toolapi.QueryLogSignalsOutput{
+		TemplateID: input.TemplateID, WindowStart: start, WindowEnd: end, Samples: samples,
+	}, nil
+}
+
+func (b *Backend) QueryTraceSignals(_ context.Context, input toolapi.QueryTraceSignalsInput) (toolapi.QueryTraceSignalsOutput, error) {
+	if !validTraceTemplate(input.TemplateID) {
+		return toolapi.QueryTraceSignalsOutput{}, fmt.Errorf("unsupported trace detection template %q", input.TemplateID)
+	}
+	start, end, samples, err := b.queryDetectionSignals(input.TemplateID, input.Namespace, input.Workload, b.data.TraceSignals)
+	if err != nil {
+		return toolapi.QueryTraceSignalsOutput{}, err
+	}
+	return toolapi.QueryTraceSignalsOutput{
+		TemplateID: input.TemplateID, WindowStart: start, WindowEnd: end, Samples: samples,
+	}, nil
+}
+
+func (b *Backend) queryDetectionSignals(
+	templateID, namespace, workload string,
+	source map[string][]toolapi.DetectionSample,
+) (time.Time, time.Time, []toolapi.DetectionSample, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if namespace != b.data.Snapshot.Target.Namespace {
+		return time.Time{}, time.Time{}, nil, model.NewError(model.CodeOutOfScope, "fixture namespace is not allowed")
+	}
+	if workload != "" && workload != b.data.Snapshot.Target.Name {
+		return time.Time{}, time.Time{}, nil, model.NewError(model.CodeOutOfScope, "fixture workload is not allowed")
+	}
+	configured := source[templateID]
+	end := b.now()
+	start := end.Add(-5 * time.Minute)
+	samples := make([]toolapi.DetectionSample, 0, len(configured))
+	seen := make(map[string]struct{}, len(configured))
+	for _, sample := range configured {
+		if sample.Namespace != namespace || sample.Workload == "" || sample.Workload != b.data.Snapshot.Target.Name {
+			return time.Time{}, time.Time{}, nil, model.NewError(model.CodeOutOfScope, "fixture detection sample has no exact namespace/workload mapping")
+		}
+		if workload != "" && sample.Workload != workload {
+			return time.Time{}, time.Time{}, nil, model.NewError(model.CodeOutOfScope, "fixture detection sample targets another workload")
+		}
+		if math.IsNaN(sample.Value) || math.IsInf(sample.Value, 0) || sample.Value < 0 || sample.Value > maxFixtureDetectionCount || math.Trunc(sample.Value) != sample.Value {
+			return time.Time{}, time.Time{}, nil, errors.New("fixture detection sample value is invalid")
+		}
+		if sample.Timestamp.IsZero() {
+			sample.Timestamp = end
+		} else {
+			sample.Timestamp = sample.Timestamp.UTC()
+		}
+		if sample.Timestamp.Before(start) || sample.Timestamp.After(end) {
+			continue
+		}
+		key := sample.Namespace + "\x00" + sample.Workload
+		if _, duplicate := seen[key]; duplicate {
+			return time.Time{}, time.Time{}, nil, errors.New("fixture detection samples contain a duplicate identity")
+		}
+		seen[key] = struct{}{}
+		samples = append(samples, sample)
+	}
+	if len(samples) > 50 {
+		return time.Time{}, time.Time{}, nil, errors.New("fixture detection result exceeds its group limit")
+	}
+	sort.Slice(samples, func(i, j int) bool {
+		if samples[i].Namespace != samples[j].Namespace {
+			return samples[i].Namespace < samples[j].Namespace
+		}
+		return samples[i].Workload < samples[j].Workload
+	})
+	return start, end, samples, nil
+}
+
+func validLogTemplate(templateID string) bool {
+	return templateID == toolapi.LogErrorBurst5m || templateID == toolapi.LogDependencyTimeoutBurst5m
+}
+
+func validTraceTemplate(templateID string) bool {
+	return templateID == toolapi.TraceErrorCount5m || templateID == toolapi.TraceSlowServerCount5m
 }
 
 func (b *Backend) SearchLogs(_ context.Context, input toolapi.SearchLogsInput) (toolapi.SearchLogsOutput, error) {

@@ -19,3 +19,4 @@ build/
 *.pem
 *.key
 deploy/kubernetes/base/secret.yaml
+deploy/kubernetes/base/whatsapp-secret.yaml

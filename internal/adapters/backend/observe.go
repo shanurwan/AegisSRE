@@ -8,6 +8,8 @@ import (
 
 type MetricsLogs interface {
 	QueryMetrics(context.Context, toolapi.QueryMetricsInput) (toolapi.QueryMetricsOutput, error)
+	QueryLogSignals(context.Context, toolapi.QueryLogSignalsInput) (toolapi.QueryLogSignalsOutput, error)
+	QueryTraceSignals(context.Context, toolapi.QueryTraceSignalsInput) (toolapi.QueryTraceSignalsOutput, error)
 	SearchLogs(context.Context, toolapi.SearchLogsInput) (toolapi.SearchLogsOutput, error)
 }
 
@@ -23,6 +25,14 @@ type Observe struct {
 
 func (o Observe) QueryMetrics(ctx context.Context, input toolapi.QueryMetricsInput) (toolapi.QueryMetricsOutput, error) {
 	return o.Telemetry.QueryMetrics(ctx, input)
+}
+
+func (o Observe) QueryLogSignals(ctx context.Context, input toolapi.QueryLogSignalsInput) (toolapi.QueryLogSignalsOutput, error) {
+	return o.Telemetry.QueryLogSignals(ctx, input)
+}
+
+func (o Observe) QueryTraceSignals(ctx context.Context, input toolapi.QueryTraceSignalsInput) (toolapi.QueryTraceSignalsOutput, error) {
+	return o.Telemetry.QueryTraceSignals(ctx, input)
 }
 
 func (o Observe) SearchLogs(ctx context.Context, input toolapi.SearchLogsInput) (toolapi.SearchLogsOutput, error) {

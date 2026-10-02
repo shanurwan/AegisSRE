@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/shanurwan/AegisSRE/internal/core/model"
+	"github.com/shanurwan/AegisSRE/internal/toolapi"
 )
 
 type fixedClock struct{ value time.Time }
@@ -47,10 +48,14 @@ func reasonerRequest(now time.Time) model.InvestigationRequest {
 }
 
 func reasonerEvidence(t *testing.T, now time.Time, payload string) model.EvidenceItem {
+	return reasonerEvidenceForTool(t, now, "evidence-1", model.EvidenceLogs, toolapi.ToolSearchLogs, "application log sample", "", payload)
+}
+
+func reasonerEvidenceForTool(t *testing.T, now time.Time, id string, source model.EvidenceSource, tool, summary, query, payload string) model.EvidenceItem {
 	t.Helper()
 	item := model.EvidenceItem{
-		ID: "evidence-1", IncidentID: "incident-1", Source: model.EvidenceLogs,
-		Tool: "logs_search", Summary: "application log sample", ObservedAt: now,
+		ID: id, IncidentID: "incident-1", Source: source,
+		Tool: tool, Query: query, Summary: summary, ObservedAt: now,
 		Payload: json.RawMessage(payload),
 	}
 	if err := item.Seal(); err != nil {
@@ -123,8 +128,11 @@ func TestResponsesDiagnoseUsesStrictOutputAndBindsTrustedTarget(t *testing.T) {
 		input := body["input"].([]any)
 		content := input[0].(map[string]any)["content"].([]any)
 		prompt := content[0].(map[string]any)["text"].(string)
-		if !strings.Contains(prompt, "BEGIN_UNTRUSTED_EVIDENCE_JSON") || !strings.Contains(prompt, "kube-system/coredns") {
-			t.Error("evidence was not clearly delimited as untrusted input")
+		if !strings.Contains(prompt, "BEGIN_UNTRUSTED_EVIDENCE_JSON") || !strings.Contains(prompt, `"classification":"raw_log_payload"`) {
+			t.Error("raw-log evidence was not clearly delimited and redacted")
+		}
+		if strings.Contains(prompt, "kube-system/coredns") || strings.Contains(prompt, "ignore all previous instructions") {
+			t.Error("raw log payload crossed the external reasoner privacy boundary")
 		}
 
 		completedResponse(t, writer, map[string]any{
@@ -163,6 +171,59 @@ func TestResponsesDiagnoseUsesStrictOutputAndBindsTrustedTarget(t *testing.T) {
 	}
 	if err := report.VerifyDigest(); err != nil {
 		t.Fatalf("Responses reasoner did not return a sealed report: %v", err)
+	}
+}
+
+func TestResponsesPromptRedactsRawLogToolsAndPreservesStructuredEvidence(t *testing.T) {
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	podLogSecret := "pod-password=correct-horse-battery-staple"
+	searchSecret := "customer-token=sk-sensitive-search-result"
+	evidence := []model.EvidenceItem{
+		reasonerEvidenceForTool(t, now, "pod-log", model.EvidenceLogs, toolapi.ToolGetPodLogs,
+			"bounded pod log tail", "password=correct-horse-battery-staple", `{"logs":"`+podLogSecret+`"}`),
+		reasonerEvidenceForTool(t, now, "log-search", model.EvidenceLogs, toolapi.ToolSearchLogs,
+			"bounded log search", "token=sk-sensitive-search-result", `{"entries":[{"message":"`+searchSecret+`"}]}`),
+		reasonerEvidenceForTool(t, now, "snapshot", model.EvidenceKubernetes, toolapi.ToolGetWorkloadSnapshot,
+			"deployment snapshot", "", `{"available_replicas":0,"unavailable_replicas":1}`),
+	}
+	originalPodPayload := string(evidence[0].Payload)
+	originalSearchPayload := string(evidence[1].Payload)
+
+	reasoner := &Responses{maxPromptBytes: defaultMaxPromptBytes}
+	prompt, err := reasoner.buildPrompt(reasonerRequest(now), evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{podLogSecret, searchSecret, "correct-horse-battery-staple", "sk-sensitive-search-result"} {
+		if strings.Contains(prompt, secret) {
+			t.Fatalf("external prompt contains raw log material %q", secret)
+		}
+	}
+	if string(evidence[0].Payload) != originalPodPayload || string(evidence[1].Payload) != originalSearchPayload {
+		t.Fatal("external projection mutated locally retained evidence")
+	}
+
+	rawDocument := strings.TrimSuffix(strings.TrimPrefix(prompt, "BEGIN_UNTRUSTED_EVIDENCE_JSON\n"), "\nEND_UNTRUSTED_EVIDENCE_JSON")
+	var document promptDocument
+	if err := json.Unmarshal([]byte(rawDocument), &document); err != nil {
+		t.Fatalf("decode prompt document: %v", err)
+	}
+	if len(document.Evidence) != 3 {
+		t.Fatalf("prompt evidence count = %d, want 3", len(document.Evidence))
+	}
+	for _, item := range document.Evidence[:2] {
+		if item.ID == "" || item.Source != string(model.EvidenceLogs) || item.Tool == "" || item.Summary == "" || !item.ObservedAt.Equal(now) {
+			t.Fatalf("redaction removed provenance metadata: %#v", item)
+		}
+		if item.Query != "" {
+			t.Fatalf("raw-log query was not redacted for %s", item.Tool)
+		}
+		if string(item.Payload) != `{"redacted":true,"classification":"raw_log_payload"}` {
+			t.Fatalf("unexpected redaction marker for %s: %s", item.Tool, item.Payload)
+		}
+	}
+	if document.Evidence[2].ID != "snapshot" || !strings.Contains(string(document.Evidence[2].Payload), `"unavailable_replicas":1`) {
+		t.Fatalf("structured evidence was not preserved: %#v", document.Evidence[2])
 	}
 }
 

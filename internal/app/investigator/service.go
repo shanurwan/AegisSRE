@@ -93,11 +93,65 @@ func (s *Service) Investigate(ctx context.Context, request model.InvestigationRe
 	}
 	evidence = append(evidence, item)
 
+	// Collect one bounded, workload-scoped view from every telemetry plane.
+	// Individual telemetry outages degrade the evidence set without hiding the
+	// Kubernetes snapshot or expanding the investigation budget.
+	type collection struct {
+		source  model.EvidenceSource
+		tool    string
+		summary string
+		input   any
+		output  any
+	}
+	collections := []collection{
+		{
+			source: model.EvidenceMetrics, tool: toolapi.ToolQueryMetrics,
+			summary: "bounded deployment availability metrics",
+			input: toolapi.QueryMetricsInput{
+				TemplateID: toolapi.MetricDeploymentUnavailable, Namespace: target.Namespace, Workload: target.Name,
+			},
+			output: &toolapi.QueryMetricsOutput{},
+		},
+		{
+			source: model.EvidenceLogs, tool: toolapi.ToolQueryLogSignals,
+			summary: "bounded five-minute application error signal",
+			input: toolapi.QueryLogSignalsInput{
+				TemplateID: toolapi.LogErrorBurst5m, Namespace: target.Namespace, Workload: target.Name,
+			},
+			output: &toolapi.QueryLogSignalsOutput{},
+		},
+		{
+			source: model.EvidenceTraces, tool: toolapi.ToolQueryTraceSignals,
+			summary: "bounded five-minute failed trace signal",
+			input: toolapi.QueryTraceSignalsInput{
+				TemplateID: toolapi.TraceErrorCount5m, Namespace: target.Namespace, Workload: target.Name,
+			},
+			output: &toolapi.QueryTraceSignalsOutput{},
+		},
+	}
+	for _, candidate := range collections {
+		if calls >= callBudget || len(evidence) >= evidenceBudget {
+			break
+		}
+		err := s.Tools.Call(ctx, candidate.tool, candidate.input, candidate.output)
+		calls++
+		if err != nil {
+			continue
+		}
+		item, err := s.evidence(request.Incident.ID, candidate.source, candidate.tool, candidate.summary, candidate.output)
+		if err != nil {
+			return model.DiagnosisReport{}, err
+		}
+		evidence = append(evidence, item)
+	}
+
 	for _, pod := range snapshot.Snapshot.Pods {
 		if calls >= callBudget || len(evidence) >= evidenceBudget {
 			break
 		}
-		if pod.Ready {
+		telemetryTriggered := request.Incident.Signal.Source == string(model.EvidenceLogs) ||
+			request.Incident.Signal.Source == string(model.EvidenceTraces)
+		if pod.Ready && !telemetryTriggered {
 			continue
 		}
 		container := ""
@@ -114,7 +168,7 @@ func (s *Service) Investigate(ctx context.Context, request model.InvestigationRe
 			continue
 		}
 		logEvidence, err := s.evidence(request.Incident.ID, model.EvidenceLogs, toolapi.ToolGetPodLogs,
-			"bounded log tail from unhealthy pod "+pod.Name, logs)
+			"bounded log tail from incident-scoped pod "+pod.Name, logs)
 		if err != nil {
 			return model.DiagnosisReport{}, err
 		}
