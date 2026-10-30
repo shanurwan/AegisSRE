@@ -86,6 +86,9 @@ type Config struct {
 	AgentFactsID             string
 	AgentFactsPrivateKey     string
 	AgentFactsPrivateKeyFile string
+	LLMAPI                   string
+	LLMThinking              string
+	LLMJSONMode              string
 }
 
 func Load(role string) (Config, error) {
@@ -105,6 +108,8 @@ func Load(role string) (Config, error) {
 		"AEGIS_LOG_LEVEL",
 		"AEGIS_DISCOVERY",
 		"AEGIS_NANDA_INDEX_URL",
+		"AEGIS_LLM_API",
+		"AEGIS_LLM_JSON_MODE",
 	} {
 		if value, exists := os.LookupEnv(name); exists && strings.TrimSpace(value) == "" {
 			return Config{}, fmt.Errorf("%s is set but empty", name)
@@ -156,6 +161,9 @@ func Load(role string) (Config, error) {
 		LogLevel:             env("AEGIS_LOG_LEVEL", "info"),
 	}
 	cfg.Discovery = env("AEGIS_DISCOVERY", "static")
+	cfg.LLMAPI = env("AEGIS_LLM_API", "responses")
+	cfg.LLMThinking = strings.TrimSpace(os.Getenv("AEGIS_LLM_THINKING"))
+	cfg.LLMJSONMode = env("AEGIS_LLM_JSON_MODE", "schema")
 	cfg.NANDAIndexURL = strings.TrimRight(env("AEGIS_NANDA_INDEX_URL", "https://api.nandaindex.org"), "/")
 	cfg.NANDAInvestigatorID = strings.TrimSpace(os.Getenv("AEGIS_NANDA_INVESTIGATOR_ID"))
 	cfg.NANDAInvestigatorKey = strings.TrimSpace(os.Getenv("AEGIS_NANDA_INVESTIGATOR_KEY"))
@@ -352,6 +360,18 @@ func (c Config) Validate() error {
 				return errors.New("AEGIS_DELEGATION_PUBLIC_KEYRING_FILE is required for an authenticated production verifier")
 			}
 		}
+	}
+	if c.LLMAPI != "responses" && c.LLMAPI != "chat_completions" {
+		return errors.New("AEGIS_LLM_API must be responses or chat_completions")
+	}
+	if c.LLMThinking != "" && c.LLMThinking != "true" && c.LLMThinking != "false" {
+		return errors.New("AEGIS_LLM_THINKING must be true, false or unset")
+	}
+	if c.LLMJSONMode != "schema" && (c.LLMJSONMode != "object" || c.LLMAPI != "chat_completions") {
+		return errors.New("AEGIS_LLM_JSON_MODE must be schema, or object with AEGIS_LLM_API=chat_completions")
+	}
+	if c.LLMThinking != "" && c.LLMAPI != "chat_completions" {
+		return errors.New("AEGIS_LLM_THINKING requires AEGIS_LLM_API=chat_completions")
 	}
 	if c.LLMBaseURL != "" && (c.LLMModel == "" || strings.TrimSpace(c.LLMAPIKey) == "") {
 		return errors.New("AEGIS_LLM_MODEL and AEGIS_LLM_API_KEY are required when AEGIS_LLM_BASE_URL is set")

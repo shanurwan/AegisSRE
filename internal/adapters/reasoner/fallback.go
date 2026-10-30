@@ -14,6 +14,9 @@ import (
 type Fallback struct {
 	Primary   ports.Reasoner
 	Secondary ports.Reasoner
+	// OnFallback, when set, is told why Primary failed, so operators can see
+	// which reasoner produced a diagnosis.
+	OnFallback func(incidentID string, err error)
 }
 
 var _ ports.Reasoner = Fallback{}
@@ -32,6 +35,9 @@ func (r Fallback) Diagnose(ctx context.Context, request model.InvestigationReque
 	report, primaryErr := r.Primary.Diagnose(ctx, request, evidence)
 	if primaryErr == nil {
 		return report, nil
+	}
+	if r.OnFallback != nil {
+		r.OnFallback(request.Incident.ID, primaryErr)
 	}
 	report, fallbackErr := r.Secondary.Diagnose(ctx, request, evidence)
 	if fallbackErr == nil {

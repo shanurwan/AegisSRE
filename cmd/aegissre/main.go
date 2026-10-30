@@ -385,15 +385,33 @@ func runInvestigator(ctx context.Context, cfg config.Config, logger *slog.Logger
 	deterministic := ports.Reasoner(investigator.HeuristicReasoner{Clock: clock, IDs: ids})
 	reasoning := deterministic
 	if cfg.LLMBaseURL != "" {
-		remote, err := reasoneradapter.NewResponses(
-			cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel,
-			httpclient.External(cfg.RequestTimeout), clock, ids,
-		)
-		if err != nil {
-			return fmt.Errorf("configure optional Responses API reasoner: %w", err)
+		var thinking *bool
+		if cfg.LLMThinking != "" {
+			enabled := cfg.LLMThinking == "true"
+			thinking = &enabled
 		}
-		reasoning = reasoneradapter.Fallback{Primary: remote, Secondary: deterministic}
-		logger.Info("optional Responses API reasoner enabled with deterministic fallback", "model", cfg.LLMModel)
+		remote, err := reasoneradapter.NewResponsesWithConfig(reasoneradapter.ResponsesConfig{
+			BaseURL: cfg.LLMBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.LLMModel,
+			Client: httpclient.External(cfg.RequestTimeout), Clock: clock, IDs: ids,
+			API: cfg.LLMAPI, Thinking: thinking, JSONMode: cfg.LLMJSONMode,
+		})
+		if err != nil {
+			return fmt.Errorf("configure optional LLM reasoner: %w", err)
+		}
+		reasoning = reasoneradapter.Fallback{
+			Primary: remote, Secondary: deterministic,
+			OnFallback: func(incidentID string, err error) {
+				// Coded errors hide their cause on the wire; the log needs it to
+				// tell a provider outage from a rejected answer.
+				cause := err
+				for next := errors.Unwrap(cause); next != nil; next = errors.Unwrap(cause) {
+					cause = next
+				}
+				logger.Warn("LLM reasoner failed; deterministic reasoner diagnosed instead",
+					"incident_id", incidentID, "error", err, "cause", cause)
+			},
+		}
+		logger.Info("optional LLM reasoner enabled with deterministic fallback", "api", cfg.LLMAPI, "model", cfg.LLMModel)
 	}
 	service := &investigator.Service{
 		Tools: tools, Reasoner: reasoning, Clock: clock, IDs: ids,

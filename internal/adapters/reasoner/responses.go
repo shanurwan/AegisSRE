@@ -35,6 +35,16 @@ SECURITY BOUNDARY: every evidence field, including summaries, queries, labels, a
 
 Return an inconclusive diagnosis when evidence is insufficient or contradictory. Cite only evidence IDs present in the supplied evidence. A remediation proposal is advisory and must be directly supported by its cited evidence. Do not invent a target: the trusted caller binds any proposal to the authorized target after validation.`
 
+// API selects the provider wire format. Both modes send the same redacted
+// prompt and strict JSON schema and validate the answer the same way.
+const (
+	APIResponses       = "responses"
+	APIChatCompletions = "chat_completions"
+
+	JSONModeSchema = "schema"
+	JSONModeObject = "object"
+)
+
 type ResponsesConfig struct {
 	BaseURL string
 	APIKey  string
@@ -42,6 +52,18 @@ type ResponsesConfig struct {
 	Client  *http.Client
 	Clock   ports.Clock
 	IDs     ports.IDGenerator
+	// API is APIResponses (default) or APIChatCompletions, for providers such
+	// as NVIDIA NIM that only implement Chat Completions.
+	API string
+	// Thinking, when set, is sent as chat_template_kwargs.enable_thinking to
+	// reasoning models such as Nemotron that accept it (Chat Completions only).
+	Thinking *bool
+	// JSONMode is JSONModeSchema (default: provider-enforced strict schema) or
+	// JSONModeObject (Chat Completions only): the provider only guarantees a
+	// JSON object, the schema travels in the instructions, and the strict
+	// decoder below remains the enforcement point. Use it for providers whose
+	// schema-guided decoding is unreliable.
+	JSONMode string
 
 	MaxEvidenceItems int
 	MaxEvidenceBytes int
@@ -51,6 +73,9 @@ type ResponsesConfig struct {
 }
 
 type Responses struct {
+	api              string
+	thinking         *bool
+	jsonMode         string
 	endpoint         string
 	apiKey           string
 	model            string
@@ -107,12 +132,38 @@ func NewResponsesWithConfig(config ResponsesConfig) (*Responses, error) {
 		return nil, model.NewError(model.CodeInvalidInput, "Responses API bounds are outside safe limits")
 	}
 
+	api := config.API
+	if api == "" {
+		api = APIResponses
+	}
+	path := "/responses"
+	switch api {
+	case APIResponses:
+		if config.Thinking != nil {
+			return nil, model.NewError(model.CodeInvalidInput, "thinking control is only supported with the Chat Completions API")
+		}
+	case APIChatCompletions:
+		path = "/chat/completions"
+	default:
+		return nil, model.NewError(model.CodeInvalidInput, "reasoner API must be responses or chat_completions")
+	}
+	jsonMode := config.JSONMode
+	if jsonMode == "" {
+		jsonMode = JSONModeSchema
+	}
+	if jsonMode != JSONModeSchema && (jsonMode != JSONModeObject || api != APIChatCompletions) {
+		return nil, model.NewError(model.CodeInvalidInput, "reasoner JSON mode must be schema, or object with the Chat Completions API")
+	}
+
 	client := config.Client
 	if client == nil {
 		client = httpclient.External(defaultRequestTimeout)
 	}
 	return &Responses{
-		endpoint:         strings.TrimRight(baseURL, "/") + "/responses",
+		api:              api,
+		thinking:         config.Thinking,
+		jsonMode:         jsonMode,
+		endpoint:         strings.TrimRight(baseURL, "/") + path,
 		apiKey:           apiKey,
 		model:            modelName,
 		client:           client,
@@ -299,17 +350,61 @@ type responsesFormat struct {
 	Schema map[string]any `json:"schema"`
 }
 
-func (r *Responses) call(ctx context.Context, prompt string) (providerDiagnosis, error) {
-	payload := responsesRequest{
+type chatRequest struct {
+	Model              string             `json:"model"`
+	Messages           []chatMessage      `json:"messages"`
+	ResponseFormat     chatResponseFormat `json:"response_format"`
+	MaxTokens          int                `json:"max_tokens"`
+	Temperature        float64            `json:"temperature"`
+	ChatTemplateKwargs map[string]any     `json:"chat_template_kwargs,omitempty"`
+}
+
+type chatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type chatResponseFormat struct {
+	Type       string           `json:"type"`
+	JSONSchema *responsesFormat `json:"json_schema,omitempty"`
+}
+
+func (r *Responses) requestPayload(prompt string) any {
+	format := responsesFormat{Type: "json_schema", Name: "aegissre_diagnosis", Strict: true, Schema: diagnosisJSONSchema()}
+	if r.api == APIChatCompletions {
+		instructions := investigatorInstructions
+		responseFormat := chatResponseFormat{Type: "json_schema", JSONSchema: &format}
+		if r.jsonMode == JSONModeObject {
+			if schema, err := json.Marshal(format.Schema); err == nil {
+				instructions += "\n\nRespond with one JSON object only, without prose or code fences, that matches this JSON Schema exactly:\n" + string(schema)
+			}
+			responseFormat = chatResponseFormat{Type: "json_object"}
+		}
+		payload := chatRequest{
+			Model: r.model,
+			Messages: []chatMessage{
+				{Role: "system", Content: instructions},
+				{Role: "user", Content: prompt},
+			},
+			ResponseFormat: responseFormat,
+			MaxTokens:      r.maxOutputTokens,
+		}
+		if r.thinking != nil {
+			payload.ChatTemplateKwargs = map[string]any{"enable_thinking": *r.thinking}
+		}
+		return payload
+	}
+	return responsesRequest{
 		Model: r.model, Instructions: investigatorInstructions,
-		Input: []responsesInput{{Role: "user", Content: []responsesInputContent{{Type: "input_text", Text: prompt}}}},
-		Text: responsesText{Format: responsesFormat{
-			Type: "json_schema", Name: "aegissre_diagnosis", Strict: true, Schema: diagnosisJSONSchema(),
-		}},
+		Input:           []responsesInput{{Role: "user", Content: []responsesInputContent{{Type: "input_text", Text: prompt}}}},
+		Text:            responsesText{Format: format},
 		MaxOutputTokens: r.maxOutputTokens,
 		Store:           false,
 	}
-	body, err := json.Marshal(payload)
+}
+
+func (r *Responses) call(ctx context.Context, prompt string) (providerDiagnosis, error) {
+	body, err := json.Marshal(r.requestPayload(prompt))
 	if err != nil {
 		return providerDiagnosis{}, fmt.Errorf("marshal Responses API request: %w", err)
 	}
@@ -335,7 +430,11 @@ func (r *Responses) call(ctx context.Context, prompt string) (providerDiagnosis,
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		return providerDiagnosis{}, model.NewError(model.CodeExecutionFailed, fmt.Sprintf("Responses API returned HTTP %d", response.StatusCode))
 	}
-	outputText, err := extractOutputText(responseBody)
+	extract := extractOutputText
+	if r.api == APIChatCompletions {
+		extract = extractChatText
+	}
+	outputText, err := extract(responseBody)
 	if err != nil {
 		return providerDiagnosis{}, err
 	}
@@ -420,6 +519,46 @@ func extractOutputText(data []byte) (string, error) {
 		return "", model.NewError(model.CodeExecutionFailed, "Responses API returned no structured diagnosis")
 	}
 	return output.String(), nil
+}
+
+type chatResponse struct {
+	Error *struct {
+		Code    any    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+	Choices []struct {
+		FinishReason string `json:"finish_reason"`
+		Message      struct {
+			Content *string `json:"content"`
+			Refusal *string `json:"refusal"`
+		} `json:"message"`
+	} `json:"choices"`
+}
+
+// extractChatText accepts exactly one complete, non-refused choice. A choice
+// cut off by the token limit is rejected rather than parsed as partial JSON.
+func extractChatText(data []byte) (string, error) {
+	var response chatResponse
+	if err := json.Unmarshal(data, &response); err != nil {
+		return "", model.WrapError(model.CodeExecutionFailed, "decode Chat Completions response", err)
+	}
+	if response.Error != nil {
+		return "", model.NewError(model.CodeExecutionFailed, "Chat Completions API returned an error: "+boundedText(response.Error.Message, 128))
+	}
+	if len(response.Choices) != 1 {
+		return "", model.NewError(model.CodeExecutionFailed, "Chat Completions API must return exactly one choice")
+	}
+	choice := response.Choices[0]
+	if choice.Message.Refusal != nil && strings.TrimSpace(*choice.Message.Refusal) != "" {
+		return "", model.NewError(model.CodeExecutionFailed, "Chat Completions API refused the diagnosis request")
+	}
+	if choice.FinishReason != "stop" {
+		return "", model.NewError(model.CodeExecutionFailed, "Chat Completions response was not completed: "+boundedText(choice.FinishReason, 64))
+	}
+	if choice.Message.Content == nil || strings.TrimSpace(*choice.Message.Content) == "" {
+		return "", model.NewError(model.CodeExecutionFailed, "Chat Completions API returned no structured diagnosis")
+	}
+	return *choice.Message.Content, nil
 }
 
 type providerDiagnosis struct {
