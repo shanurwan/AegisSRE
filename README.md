@@ -198,6 +198,24 @@ AegisSRE is not:
 - permission to make an action more powerful because a diagnosis sounds confident;
 - production-ready merely because the fixture demo completes.
 
+## Contributing
+
+Contributions are welcome, from a bug report to a new bounded tool. The short version:
+
+1. Read [CONTRIBUTING.md](CONTRIBUTING.md). It covers the architecture rules, the safety bar for a new tool or action, and protocol changes.
+2. Report a vulnerability privately through [SECURITY.md](SECURITY.md), never in a public issue.
+3. Open a design issue first for a new action, tool, protocol or policy change.
+4. Work on a topic branch, then open a pull request against `main` that states the problem, design, privilege or network change, testing, and remaining limits.
+5. Get the required checks green. `main` is protected: no direct or force pushes, and no merge until the [Test](.github/workflows/test.yml) and [Security](.github/workflows/security.yml) workflows pass on a branch that is up to date.
+
+Before you push:
+
+```bash
+make verify          # vet, unit tests, harness tests
+go test -race ./...
+make security-dast   # optional locally; CI runs it on every pull request
+```
+
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE).

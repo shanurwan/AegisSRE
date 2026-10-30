@@ -15,7 +15,7 @@ This project intentionally values a narrow, explainable capability over a broad 
 
 Prerequisites:
 
-- Go 1.26 or newer
+- Go 1.26.10 or newer (CI and the release image pin 1.26.10)
 - Docker with Compose for the local topology
 - `kubectl` only for rendering/validating Kubernetes manifests
 
@@ -129,6 +129,27 @@ Update documentation in the same pull request when changing:
 
 `.env.example` must contain placeholders only. Kubernetes Secret examples must never contain generated values.
 
+## Branch and pull request workflow
+
+`main` is protected by the ruleset in [`.github/rulesets/main.json`](.github/rulesets/main.json), applied with `scripts/apply-branch-protection.sh`. Every change, including the maintainer's, lands through a pull request:
+
+1. Fork the repository (or branch, if you have write access) and create a topic branch from an up-to-date `main`, named by intent: `fix/…`, `feat/…`, `ci/…`, `docs/…`.
+2. Make one focused change, with tests and documentation in the same branch.
+3. Open a pull request against `main` and fill in the five points below.
+4. Wait for every required check to pass. `main` cannot be pushed to directly, force-pushed or deleted, and a pull request cannot merge while a check is failing, the branch is behind `main`, or a review thread is unresolved.
+5. The maintainer merges with a merge commit, or squashes a branch whose history is noise.
+
+The required checks are:
+
+| Workflow | Checks |
+|---|---|
+| [Test](.github/workflows/test.yml) | `go` (formatting, unit and E2E tests, vet, govulncheck), `race`, `deployment-assets` (manifest policy, Compose, release image build and Trivy scan) |
+| [Security](.github/workflows/security.yml) | gitleaks, gosec + Semgrep, CodeQL, OSV-Scanner + Trivy, Trivy IaC, actionlint + zizmor, ZAP DAST, IAST |
+
+Each security gate is blocking. [docs/security-pipeline.md](docs/security-pipeline.md) explains what fails each one and how to run the dynamic gates locally (`make security-dast`, `make security-iast`). Do not silence a finding to get a green run: fix it, or justify a narrow exception in the same pull request (`#nosec <rule> -- reason`, or one rule/method/path entry in `security/dast/accepted-risks.json`).
+
+Dependabot opens weekly update pull requests for Go modules, SHA-pinned Actions and digest-pinned base images. They go through the same checks.
+
 ## Commit and pull request quality
 
 Use clear, imperative commit messages. A pull request should explain:
@@ -142,6 +163,8 @@ Use clear, imperative commit messages. A pull request should explain:
 Before requesting review:
 
 - [ ] `go test ./...`, race tests, and `go vet ./...` pass where supported.
+- [ ] The Test and Security workflows are green, with any new suppression justified inline.
+- [ ] Every new third-party Action, image or tool is pinned by commit SHA, digest or checksum.
 - [ ] Generated/build artifacts and `.env` are not staged.
 - [ ] No secret, key, kubeconfig, token, or sensitive fixture is included.
 - [ ] New tool inputs/results are bounded and typed.

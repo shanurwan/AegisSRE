@@ -1,0 +1,44 @@
+{
+  "name": "main",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] }
+  },
+  "bypass_actors": [],
+  "rules": [
+    { "type": "deletion" },
+    { "type": "non_fast_forward" },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 0,
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": false,
+        "require_last_push_approval": false,
+        "required_review_thread_resolution": true,
+        "allowed_merge_methods": ["merge", "squash"]
+      }
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": true,
+        "do_not_enforce_on_create": false,
+        "required_status_checks": [
+          { "context": "go", "integration_id": 15368 },
+          { "context": "race", "integration_id": 15368 },
+          { "context": "deployment-assets", "integration_id": 15368 },
+          { "context": "Secrets · gitleaks (full history)", "integration_id": 15368 },
+          { "context": "SAST · gosec + Semgrep", "integration_id": 15368 },
+          { "context": "SAST · CodeQL", "integration_id": 15368 },
+          { "context": "Dependencies · OSV-Scanner + Trivy (vulns, secrets)", "integration_id": 15368 },
+          { "context": "IaC · Trivy misconfiguration (rendered Kubernetes, Dockerfiles, Compose)", "integration_id": 15368 },
+          { "context": "CI/CD · actionlint + zizmor", "integration_id": 15368 },
+          { "context": "DAST · ZAP active API scan of the release image", "integration_id": 15368 },
+          { "context": "IAST · race- and coverage-instrumented runtime under attack", "integration_id": 15368 }
+        ]
+      }
+    }
+  ]
+}
