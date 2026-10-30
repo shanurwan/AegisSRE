@@ -1,0 +1,45 @@
+# Runs the fixture topology with NANDA discovery against a NANDA Index.
+# Investigator and Operator publish signed AgentFacts under per-agent
+# subdomains (the Index allows one verified entry per domain); Monitor finds
+# both only through the Index. See docs/nanda.md and examples/nanda/README.md.
+#
+#   docker compose -f compose.yaml -f examples/nanda/compose.yaml --env-file examples/nanda/.env up -d
+services:
+  aegis-investigator:
+    environment:
+      AEGIS_PUBLIC_URL: http://investigator.aegissre.test:8080
+      AEGIS_AGENTFACTS_ID: urn:air:investigator.aegissre.test:agent:investigator
+      AEGIS_AGENTFACTS_PRIVATE_KEY: "${NANDA_INVESTIGATOR_PRIVATE_KEY:?run aegissre keygen -agentfacts}"
+    networks:
+      observe:
+        aliases: [investigator.aegissre.test]
+
+  aegis-operator:
+    environment:
+      AEGIS_PUBLIC_URL: http://operator.aegissre.test:8080
+      AEGIS_AGENTFACTS_ID: urn:air:operator.aegissre.test:agent:operator
+      AEGIS_AGENTFACTS_PRIVATE_KEY: "${NANDA_OPERATOR_PRIVATE_KEY:?run aegissre keygen -agentfacts}"
+    networks:
+      control:
+        aliases: [operator.aegissre.test]
+      operate: {}
+
+  aegis-monitor:
+    environment:
+      AEGIS_DISCOVERY: nanda
+      # "server" is the API service of nanda-index-v2's own docker-compose.yml.
+      AEGIS_NANDA_INDEX_URL: "${NANDA_INDEX_URL:-http://server:3001}"
+      AEGIS_NANDA_ALLOW_HTTP: "true"
+      AEGIS_NANDA_INVESTIGATOR_ID: urn:air:investigator.aegissre.test:agent:investigator
+      AEGIS_NANDA_INVESTIGATOR_KEY: "${NANDA_INVESTIGATOR_DID:?pin the Investigator did:key}"
+      AEGIS_NANDA_OPERATOR_ID: urn:air:operator.aegissre.test:agent:operator
+      AEGIS_NANDA_OPERATOR_KEY: "${NANDA_OPERATOR_DID:?pin the Operator did:key}"
+      # The static addresses are deliberately unusable in this example.
+      AEGIS_INVESTIGATOR_URL: http://static.invalid
+      AEGIS_OPERATOR_URL: http://static.invalid
+    networks: [observe, control, nanda]
+
+networks:
+  nanda:
+    name: "${NANDA_NETWORK:-nanda_default}"
+    external: true
