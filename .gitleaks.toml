@@ -1,0 +1,10 @@
+# Default gitleaks rules, plus one narrow exception.
+[extend]
+useDefault = true
+
+# An Ed25519 did:key is a public key by definition; the demo data records
+# which key was pinned and which was presented. Nothing secret can match.
+[[allowlists]]
+description = "Ed25519 did:key public keys"
+regexTarget = "line"
+regexes = ['''"(pinned_key|presented_key)": "did:key:z6Mk[1-9A-HJ-NP-Za-km-z]{44}"''']
