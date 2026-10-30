@@ -1,0 +1,82 @@
+{
+  "generator": "go run ./hack/breach demo/data/scenarios.json",
+  "scenarios": [
+    {
+      "id": "legitimate",
+      "blocked": false,
+      "layer": "action-mcp",
+      "message": "receipt receipt-demo-0001",
+      "evidence": {
+        "dry_run": true,
+        "outcome": "dry_run"
+      }
+    },
+    {
+      "id": "poisoned-logs",
+      "blocked": true,
+      "layer": "reasoner-boundary",
+      "message": "raw log payloads never reach the model",
+      "evidence": {
+        "injection_reached_model": false,
+        "marker_in_prompt": true,
+        "model_saw": "{\"redacted\":true,\"classification\":\"raw_log_payload\"}"
+      }
+    },
+    {
+      "id": "hijacked-target",
+      "blocked": true,
+      "layer": "action-mcp-policy",
+      "code": "OUT_OF_SCOPE",
+      "message": "target namespace is not allowed"
+    },
+    {
+      "id": "forged-grant",
+      "blocked": true,
+      "layer": "action-mcp-signature",
+      "code": "INVALID_SIGNATURE",
+      "message": "delegation grant signature verification failed"
+    },
+    {
+      "id": "tampered-grant",
+      "blocked": true,
+      "layer": "action-mcp-signature",
+      "code": "INVALID_SIGNATURE",
+      "message": "delegation grant signature verification failed"
+    },
+    {
+      "id": "replayed-grant",
+      "blocked": true,
+      "layer": "action-mcp-replay",
+      "message": "a second delivery returns the first receipt; the action does not run again",
+      "evidence": {
+        "executions": 1,
+        "first_receipt": "receipt-demo-0001",
+        "second_receipt": "receipt-demo-0001"
+      }
+    },
+    {
+      "id": "expired-grant",
+      "blocked": true,
+      "layer": "action-mcp-expiry",
+      "code": "GRANT_EXPIRED",
+      "message": "delegation grant has expired"
+    },
+    {
+      "id": "stale-world",
+      "blocked": true,
+      "layer": "action-mcp-precondition",
+      "code": "STALE_PRECONDITION",
+      "message": "deployment resourceVersion changed after delegation"
+    },
+    {
+      "id": "impersonated-operator",
+      "blocked": true,
+      "layer": "nanda-resolver",
+      "message": "AgentFacts is signed by a key other than the pinned key",
+      "evidence": {
+        "pinned_key": "did:key:z6MkhEvLoNf6nK3sJLkXDzKZU14aen2VGNQjprv8EVgAQU6k",
+        "presented_key": "did:key:z6MkrJe2ygSFfiVhaZioBhsqbEfBwjDLVQf3bmPxbhk2LkF9"
+      }
+    }
+  ]
+}

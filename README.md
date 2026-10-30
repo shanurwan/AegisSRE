@@ -8,6 +8,10 @@ The safety boundary is deliberate: diagnosis does not imply permission, and perm
 
 > **Project status:** pre-release. The control plane, strict workload mTLS, exact workload policy binding, overlapping delegation-key verification, OTLP trace export, and PostgreSQL-backed Monitor/execution/audit/report-outbox paths are implemented and tested in repository scope. Deterministic E2E tests cross real MCP, A2A, and notification HTTP boundaries; PostgreSQL integration tests exercise competing owners, replay recovery, leases, and outbox transitions against a real PostgreSQL service in CI. This is not a live-k3s acceptance claim. The gated laboratory runner is checked in, but it has not been executed against `laboratory`; production images, certificates/secrets, external HA PostgreSQL, authoritative collector identity enrichment, and restricted WhatsApp egress are not provisioned by this repository.
 
+## Breach AegisSRE
+
+[`demo/`](demo/) is a 3D game: you play the attacker against the three agents and try eight real attacks: prompt injection through logs, a hijacked target, a forged grant, an edited grant, replay, an expired grant, a stale world, and impersonating Operator through NANDA. For each one you predict which defence stops it, then watch it get stopped. Every outcome on screen is recorded by [`hack/breach`](hack/breach/main.go), which runs the attack against the real action plane, reasoner and NANDA resolver. A test fails if the recorded file and the code ever disagree, and the deploy workflow runs that test before publishing.
+
 ## System shape
 
 ```text

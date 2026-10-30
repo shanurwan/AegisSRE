@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Breach AegisSRE</title>
+<meta name="description" content="Play the attacker against AegisSRE's autonomous SRE agents. Every outcome is recorded from the real code.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@600;700&family=IBM+Plex+Sans:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="shell">
+  <header class="hud">
+    <div class="brand">
+      <h1>Breach <span>AegisSRE</span></h1>
+      <p>Three AI agents can fix production. Try to make them do damage. <span id="dataNote"></span></p>
+    </div>
+    <div class="stats" aria-live="polite">
+      <div class="stat"><b id="statBlocked">0/8</b><small>Attacks tried</small></div>
+      <div class="stat"><b id="statRight">0/8</b><small>Right calls</small></div>
+      <div class="stat"><b id="statScore">0</b><small>Score / 1200</small></div>
+    </div>
+  </header>
+
+  <main class="arena">
+    <nav class="card levels" id="levelList" aria-label="Attacks"><h2>Attacks</h2></nav>
+    <section class="card stage" id="stage" aria-label="3D model of AegisSRE">
+      <div class="labels" id="labels"></div>
+      <div class="banner" id="banner" hidden></div>
+      <div class="hint">Drag to orbit · scroll or pinch to zoom</div>
+    </section>
+    <section class="card console" id="console" aria-live="polite"></section>
+  </main>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js" integrity="sha384-CI3ELBVUz9XQO+97x6nwMDPosPR5XvsxW2ua7N1Xeygeh1IxtgqtCkGfQY9WWdHu" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js" integrity="sha384-wagZhIFgY4hD+7awjQjR4e2E294y6J2HSnd8eTNc15ZubTeQeVRZwhQJ+W6hnBsf" crossorigin="anonymous"></script>
+<script src="game.js"></script>
+</body>
+</html>
