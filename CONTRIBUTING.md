@@ -131,7 +131,7 @@ Update documentation in the same pull request when changing:
 
 ## Branch and pull request workflow
 
-`main` is protected by the ruleset in [`.github/rulesets/main.json`](.github/rulesets/main.json), applied with `scripts/apply-branch-protection.sh`. Every change, including the maintainer's, lands through a pull request:
+`main` is protected by the ruleset in [`.github/rulesets/main.json`](.github/rulesets/main.json). Every change, including the maintainer's, lands through a pull request:
 
 1. Fork the repository (or branch, if you have write access) and create a topic branch from an up-to-date `main`, named by intent: `fix/…`, `feat/…`, `ci/…`, `docs/…`.
 2. Make one focused change, with tests and documentation in the same branch.
