@@ -1,0 +1,55 @@
+# DAST attack surface of the observe and action MCP planes in the compose
+# fixture topology. ZAP's API scan imports this file and actively attacks
+# every operation; it is not a public API contract.
+openapi: 3.0.3
+info:
+  title: AegisSRE MCP surface (DAST)
+  version: "1"
+servers:
+  - url: http://localhost:8080
+paths:
+  /healthz:
+    get:
+      responses:
+        "200": { description: Liveness }
+  /readyz:
+    get:
+      responses:
+        "200": { description: Readiness }
+  /metrics:
+    get:
+      responses:
+        "200": { description: Prometheus metrics }
+  /mcp:
+    post:
+      parameters:
+        - name: MCP-Protocol-Version
+          in: header
+          required: true
+          schema: { type: string, example: "2026-07-28" }
+        - name: Accept
+          in: header
+          required: true
+          schema: { type: string, example: "application/json, text/event-stream" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                jsonrpc: { type: string, example: "2.0" }
+                id: { type: integer, example: 1 }
+                method: { type: string, example: tools/call }
+                params:
+                  type: object
+                  properties:
+                    name: { type: string, example: k8s_get_workload_snapshot }
+                    arguments:
+                      type: object
+                      properties:
+                        namespace: { type: string, example: outage-arena }
+                        kind: { type: string, example: Deployment }
+                        name: { type: string, example: web }
+      responses:
+        "200": { description: JSON-RPC response }

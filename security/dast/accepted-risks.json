@@ -1,0 +1,8 @@
+[
+  {
+    "plugin": "10098",
+    "method": "GET",
+    "path": "/.well-known/agent-card.json",
+    "reason": "The A2A Agent Card is a public, unauthenticated discovery document that registries and browser-based inspectors must read cross-origin. It is served with a wildcard origin and never with credentials; the credentialed origin reflection the SDK emits is removed by publicDocument and covered by TestAgentCardNeverGrantsCredentialedCrossOriginReads."
+  }
+]

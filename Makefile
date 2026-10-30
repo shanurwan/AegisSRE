@@ -25,6 +25,8 @@ help:
 	@echo "  compose-down       stop the fixture topology"
 	@echo "  compose-logs       follow fixture logs"
 	@echo "  manifests-*        render a fail-closed or policy-gated Kubernetes overlay"
+	@echo "  security-dast      ZAP-attack the release image topology (needs Docker)"
+	@echo "  security-iast      run the instrumented topology under attack and assess it"
 
 build:
 	@mkdir -p $(dir $(BINARY))
@@ -100,3 +102,20 @@ manifest-policy-overlays:
 
 live-k3s-acceptance-help:
 	python hack/e2e-k3s.py --help
+
+.PHONY: security-dast security-iast
+
+IAST_COMPOSE := -f compose.yaml -f security/iast/compose.yaml
+
+security-dast:
+	$(DOCKER) build --build-arg GO_VERSION=1.26.10 --tag aegissre:local .
+	$(DOCKER) compose up --detach --no-build --wait
+	security/dast/scan.sh build/dast; status=$$?; $(DOCKER) compose down --timeout 15; exit $$status
+
+security-iast:
+	$(DOCKER) build --file security/iast/Dockerfile --build-arg GO_VERSION=1.26.10 --tag aegissre:iast .
+	rm -rf build/iast build/iast-zap && mkdir -p build/iast && chmod 0777 build/iast
+	$(DOCKER) compose $(IAST_COMPOSE) up --detach --no-build --wait
+	-security/dast/scan.sh build/iast-zap
+	$(DOCKER) compose $(IAST_COMPOSE) stop --timeout 30
+	security/iast/assess.sh $(IAST_COMPOSE); status=$$?; $(DOCKER) compose $(IAST_COMPOSE) down --timeout 15; exit $$status

@@ -181,6 +181,7 @@ The dependency rule points inward: domain and application code must not import H
 
 - [Architecture](docs/architecture.md)
 - [Security model](docs/security-model.md)
+- [Security pipeline](docs/security-pipeline.md): secrets, SAST, dependency, container, IaC, CI/CD, DAST and IAST gates
 - [Deployment](docs/deployment.md)
 - [Local demo](docs/demo.md)
 - [Operations runbook](docs/runbook.md)
