@@ -143,7 +143,7 @@ The required checks are:
 
 | Workflow | Checks |
 |---|---|
-| [Test](.github/workflows/test.yml) | `go` (formatting, unit and E2E tests, vet, govulncheck), `race`, `deployment-assets` (manifest policy, Compose, release image build and Trivy scan) |
+| [Test](.github/workflows/test.yml) | `go` (formatting, unit and E2E tests, vet, govulncheck), `race`, `deployment-assets` (manifest policy, Compose, release image build and Trivy scan), `nanda-interop` (AgentFacts verified by NANDA's own signing code) |
 | [Security](.github/workflows/security.yml) | gitleaks, gosec + Semgrep, CodeQL, OSV-Scanner + Trivy, Trivy IaC, actionlint + zizmor, ZAP DAST, IAST |
 
 Each security gate is blocking. [docs/security-pipeline.md](docs/security-pipeline.md) explains what fails each one and how to run the dynamic gates locally (`make security-dast`, `make security-iast`). Do not silence a finding to get a green run: fix it, or justify a narrow exception in the same pull request (`#nosec <rule> -- reason`, or one rule/method/path entry in `security/dast/accepted-risks.json`).

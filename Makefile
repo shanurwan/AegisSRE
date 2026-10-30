@@ -27,6 +27,7 @@ help:
 	@echo "  manifests-*        render a fail-closed or policy-gated Kubernetes overlay"
 	@echo "  security-dast      ZAP-attack the release image topology (needs Docker)"
 	@echo "  security-iast      run the instrumented topology under attack and assess it"
+	@echo "  nanda-interop      verify AegisSRE AgentFacts with NANDA's own signing code"
 
 build:
 	@mkdir -p $(dir $(BINARY))
@@ -103,7 +104,7 @@ manifest-policy-overlays:
 live-k3s-acceptance-help:
 	python hack/e2e-k3s.py --help
 
-.PHONY: security-dast security-iast
+.PHONY: security-dast security-iast nanda-interop
 
 IAST_COMPOSE := -f compose.yaml -f security/iast/compose.yaml
 
@@ -119,3 +120,15 @@ security-iast:
 	-security/dast/scan.sh build/iast-zap
 	$(DOCKER) compose $(IAST_COMPOSE) stop --timeout 30
 	security/iast/assess.sh $(IAST_COMPOSE); status=$$?; $(DOCKER) compose $(IAST_COMPOSE) down --timeout 15; exit $$status
+
+NANDA_INDEX_COMMIT := fc9bc8bb9b15a4816123f2347feb25479d5b4ce8
+NANDA_SIGNING_SHA256 := e545d8e74bb15bc3dc3a0c19c4ae00f82978a5c039aab6ea083984da692152f3
+NODE_IMAGE := node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85
+
+nanda-interop:
+	rm -rf build/nanda-interop
+	$(GO) run ./hack/nanda-interop build/nanda-interop
+	curl -fsSLo build/nanda-interop/signing.ts https://raw.githubusercontent.com/projnanda/nanda-index-v2/$(NANDA_INDEX_COMMIT)/server/src/services/signing.ts
+	echo "$(NANDA_SIGNING_SHA256)  build/nanda-interop/signing.ts" | sha256sum -c -
+	cp hack/nanda-interop/verify.ts build/nanda-interop/
+	$(DOCKER) run --rm --network none -v "$(CURDIR)/build/nanda-interop:/w:ro" -w /w $(NODE_IMAGE) node --experimental-strip-types --no-warnings verify.ts /w

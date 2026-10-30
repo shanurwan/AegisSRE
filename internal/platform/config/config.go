@@ -75,6 +75,17 @@ type Config struct {
 	WhatsAppTemplate         string
 	WhatsAppLanguage         string
 	LogLevel                 string
+	Discovery                string
+	NANDAIndexURL            string
+	NANDAInvestigatorID      string
+	NANDAInvestigatorKey     string
+	NANDAOperatorID          string
+	NANDAOperatorKey         string
+	NANDAAllowHTTP           bool
+	NANDACacheTTL            time.Duration
+	AgentFactsID             string
+	AgentFactsPrivateKey     string
+	AgentFactsPrivateKeyFile string
 }
 
 func Load(role string) (Config, error) {
@@ -92,6 +103,8 @@ func Load(role string) (Config, error) {
 		"AEGIS_BACKEND",
 		"AEGIS_DELEGATION_KEY_ID",
 		"AEGIS_LOG_LEVEL",
+		"AEGIS_DISCOVERY",
+		"AEGIS_NANDA_INDEX_URL",
 	} {
 		if value, exists := os.LookupEnv(name); exists && strings.TrimSpace(value) == "" {
 			return Config{}, fmt.Errorf("%s is set but empty", name)
@@ -142,6 +155,15 @@ func Load(role string) (Config, error) {
 		WhatsAppLanguage:     env("AEGIS_WHATSAPP_LANGUAGE", "en_US"),
 		LogLevel:             env("AEGIS_LOG_LEVEL", "info"),
 	}
+	cfg.Discovery = env("AEGIS_DISCOVERY", "static")
+	cfg.NANDAIndexURL = strings.TrimRight(env("AEGIS_NANDA_INDEX_URL", "https://api.nandaindex.org"), "/")
+	cfg.NANDAInvestigatorID = strings.TrimSpace(os.Getenv("AEGIS_NANDA_INVESTIGATOR_ID"))
+	cfg.NANDAInvestigatorKey = strings.TrimSpace(os.Getenv("AEGIS_NANDA_INVESTIGATOR_KEY"))
+	cfg.NANDAOperatorID = strings.TrimSpace(os.Getenv("AEGIS_NANDA_OPERATOR_ID"))
+	cfg.NANDAOperatorKey = strings.TrimSpace(os.Getenv("AEGIS_NANDA_OPERATOR_KEY"))
+	cfg.AgentFactsID = strings.TrimSpace(os.Getenv("AEGIS_AGENTFACTS_ID"))
+	cfg.AgentFactsPrivateKey = os.Getenv("AEGIS_AGENTFACTS_PRIVATE_KEY")
+	cfg.AgentFactsPrivateKeyFile = strings.TrimSpace(os.Getenv("AEGIS_AGENTFACTS_PRIVATE_KEY_FILE"))
 	var err error
 	if cfg.ScanInterval, err = duration("AEGIS_SCAN_INTERVAL", 30*time.Second); err != nil {
 		return Config{}, err
@@ -197,6 +219,12 @@ func Load(role string) (Config, error) {
 	if cfg.OutboxMaxAttempts, err = integer("AEGIS_OUTBOX_MAX_ATTEMPTS", 8); err != nil {
 		return Config{}, err
 	}
+	if cfg.NANDAAllowHTTP, err = boolean("AEGIS_NANDA_ALLOW_HTTP", false); err != nil {
+		return Config{}, err
+	}
+	if cfg.NANDACacheTTL, err = duration("AEGIS_NANDA_CACHE_TTL", 5*time.Minute); err != nil {
+		return Config{}, err
+	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -204,6 +232,9 @@ func Load(role string) (Config, error) {
 }
 
 func (c Config) Validate() error {
+	if err := c.validateDiscovery(); err != nil {
+		return err
+	}
 	if c.ListenAddr == "" || c.AdminListenAddr == "" || c.PublicURL == "" || c.AllowedNamespace == "" {
 		return errors.New("listen address, public URL, and allowed namespace are required")
 	}
@@ -554,4 +585,51 @@ func boolean(name string, fallback bool) (bool, error) {
 	default:
 		return false, fmt.Errorf("%s must be true or false", name)
 	}
+}
+
+func (c Config) validateDiscovery() error {
+	switch c.Discovery {
+	case "static":
+	case "nanda":
+		if c.Role != "monitor" {
+			break
+		}
+		index, err := url.Parse(c.NANDAIndexURL)
+		if err != nil || index.Host == "" || (index.Scheme != "https" && (index.Scheme != "http" || !c.NANDAAllowHTTP)) {
+			return errors.New("AEGIS_NANDA_INDEX_URL must be an https URL (http only with AEGIS_NANDA_ALLOW_HTTP=true)")
+		}
+		for name, value := range map[string]string{
+			"AEGIS_NANDA_INVESTIGATOR_ID": c.NANDAInvestigatorID, "AEGIS_NANDA_OPERATOR_ID": c.NANDAOperatorID,
+		} {
+			if !strings.HasPrefix(value, "urn:air:") {
+				return fmt.Errorf("%s must be a urn:air: identifier when AEGIS_DISCOVERY=nanda", name)
+			}
+		}
+		for name, value := range map[string]string{
+			"AEGIS_NANDA_INVESTIGATOR_KEY": c.NANDAInvestigatorKey, "AEGIS_NANDA_OPERATOR_KEY": c.NANDAOperatorKey,
+		} {
+			if !strings.HasPrefix(value, "did:key:") {
+				return fmt.Errorf("%s must pin the peer's did:key when AEGIS_DISCOVERY=nanda", name)
+			}
+		}
+	default:
+		return errors.New("AEGIS_DISCOVERY must be static or nanda")
+	}
+	if c.NANDACacheTTL < 10*time.Second || c.NANDACacheTTL > time.Hour {
+		return errors.New("AEGIS_NANDA_CACHE_TTL must be between ten seconds and one hour")
+	}
+	if c.MTLSEnabled && c.NANDAAllowHTTP {
+		return errors.New("AEGIS_NANDA_ALLOW_HTTP is for local fixtures and cannot be combined with mTLS")
+	}
+	if c.AgentFactsPrivateKey != "" && c.AgentFactsPrivateKeyFile != "" {
+		return errors.New("configure only one of AEGIS_AGENTFACTS_PRIVATE_KEY or AEGIS_AGENTFACTS_PRIVATE_KEY_FILE")
+	}
+	hasKey := c.AgentFactsPrivateKey != "" || c.AgentFactsPrivateKeyFile != ""
+	if hasKey != (c.AgentFactsID != "") {
+		return errors.New("AEGIS_AGENTFACTS_ID and an AgentFacts private key must be configured together")
+	}
+	if c.AgentFactsID != "" && !strings.HasPrefix(c.AgentFactsID, "urn:air:") {
+		return errors.New("AEGIS_AGENTFACTS_ID must be a urn:air: identifier")
+	}
+	return nil
 }

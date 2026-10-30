@@ -22,6 +22,12 @@ type PeerMessenger interface {
 	Send(context.Context, string, model.Envelope, any) error
 }
 
+// PeerResolver returns the A2A base URL of a peer agent, verified by whatever
+// discovery mechanism is configured.
+type PeerResolver interface {
+	Resolve(context.Context, model.AgentID) (string, error)
+}
+
 // Reasoner converts bounded, pre-collected evidence into a diagnosis. It is
 // advisory: proposals are still checked and signed by the Monitor policy.
 type Reasoner interface {
