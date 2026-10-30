@@ -619,7 +619,7 @@ func actionPolicy(cfg config.Config) (*security.Policy, error) {
 		AllowedActions:    []model.ActionKind{model.ActionRestartDeployment, model.ActionScaleDeployment},
 		MinimumConfidence: 0.8, MinimumEvidence: 1,
 		MaximumGrantTTL: cfg.DelegationTTL, RequireDryRun: cfg.DryRun,
-		MaximumReplicas: int32(cfg.MaxScaleReplicas), MaximumReplicaIncrease: int32(cfg.MaxScaleIncrease),
+		MaximumReplicas: int32(cfg.MaxScaleReplicas), MaximumReplicaIncrease: int32(cfg.MaxScaleIncrease), // #nosec G115 -- Config.Validate bounds both to [1,1000]
 	}
 	if cfg.WorkloadPolicyPath != "" {
 		document, err := security.LoadWorkloadPolicy(cfg.WorkloadPolicyPath)
@@ -820,7 +820,7 @@ func openPostgres(ctx context.Context, cfg config.Config, checkSchema bool) (*pg
 	if err := validatePostgresTransport(cfg, poolConfig); err != nil {
 		return nil, err
 	}
-	poolConfig.MaxConns = int32(cfg.DatabaseMaxConnections)
+	poolConfig.MaxConns = int32(cfg.DatabaseMaxConnections) // #nosec G115 -- Config.Validate bounds this to [1,50]
 	poolConfig.MinConns = 1
 	poolConfig.MaxConnLifetime = 30 * time.Minute
 	poolConfig.MaxConnIdleTime = 5 * time.Minute
@@ -1022,9 +1022,20 @@ func serve(
 	)
 }
 
+// securityHeaders stops browsers from content-sniffing JSON into active
+// content and from embedding responses in cross-origin pages. CORS reads of
+// the public Agent Card are governed separately by CORS, not by CORP.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("X-Content-Type-Options", "nosniff")
+		writer.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+		next.ServeHTTP(writer, request)
+	})
+}
+
 func newHTTPServer(address string, handler http.Handler) *http.Server {
 	return &http.Server{
-		Addr: address, Handler: handler, ReadHeaderTimeout: 5 * time.Second,
+		Addr: address, Handler: securityHeaders(handler), ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout: 30 * time.Second, WriteTimeout: 2 * time.Minute,
 		IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 1 << 20,
 	}

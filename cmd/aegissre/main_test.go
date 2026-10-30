@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -123,5 +125,19 @@ func TestRuntimeInstanceIDPrefersConfiguredPodIdentity(t *testing.T) {
 	cfg := config.Config{Role: "operator", InstanceID: "pod-uid-123"}
 	if got := runtimeInstanceID(cfg); got != cfg.InstanceID {
 		t.Fatalf("runtimeInstanceID() = %q, want %q", got, cfg.InstanceID)
+	}
+}
+
+func TestEveryServerSetsBrowserHardeningHeaders(t *testing.T) {
+	server := newHTTPServer(":0", http.NotFoundHandler())
+	recorder := httptest.NewRecorder()
+	server.Handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/missing", nil))
+	for header, want := range map[string]string{
+		"X-Content-Type-Options":       "nosniff",
+		"Cross-Origin-Resource-Policy": "same-origin",
+	} {
+		if got := recorder.Header().Get(header); got != want {
+			t.Fatalf("%s = %q, want %q", header, got, want)
+		}
 	}
 }

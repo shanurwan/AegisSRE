@@ -146,13 +146,25 @@ func NewHandler(config CardConfig, handle Handler) (http.Handler, *a2a.AgentCard
 		a2asrv.WithCapabilityChecks(&card.Capabilities),
 	)
 	mux := http.NewServeMux()
-	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(card))
+	mux.Handle(a2asrv.WellKnownAgentCardPath, publicDocument(a2asrv.NewStaticAgentCardHandler(card)))
 	rpc := a2asrv.NewJSONRPCHandler(requestHandler)
 	mux.Handle("/a2a", http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		request.Body = http.MaxBytesReader(writer, request.Body, 1<<20)
 		rpc.ServeHTTP(writer, request)
 	}))
 	return mux, card, nil
+}
+
+// publicDocument serves a discovery document to any origin without
+// credentials. The SDK echoes a request Origin together with
+// Access-Control-Allow-Credentials: true; without an Origin it answers with
+// the wildcard, which browsers never combine with credentials.
+func publicDocument(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		request = request.Clone(request.Context())
+		request.Header.Del("Origin")
+		next.ServeHTTP(writer, request)
+	})
 }
 
 func envelopeFromParts(parts a2a.ContentParts) (model.Envelope, error) {
