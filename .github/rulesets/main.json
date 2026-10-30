@@ -29,6 +29,7 @@
           { "context": "go", "integration_id": 15368 },
           { "context": "race", "integration_id": 15368 },
           { "context": "deployment-assets", "integration_id": 15368 },
+          { "context": "NANDA interop · AgentFacts verified by NANDA's own signing code", "integration_id": 15368 },
           { "context": "Secrets · gitleaks (full history)", "integration_id": 15368 },
           { "context": "SAST · gosec + Semgrep", "integration_id": 15368 },
           { "context": "SAST · CodeQL", "integration_id": 15368 },

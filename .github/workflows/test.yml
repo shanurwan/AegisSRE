@@ -133,3 +133,39 @@ jobs:
           ignore-unfixed: true
           vuln-type: os,library
           severity: HIGH,CRITICAL
+
+  nanda-interop:
+    name: NANDA interop · AgentFacts verified by NANDA's own signing code
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: "1.26.10"
+          cache: true
+
+      - name: Sign AgentFacts with AegisSRE
+        run: go run ./hack/nanda-interop "$RUNNER_TEMP/interop"
+
+      # The verifier is the NANDA Index's unmodified signing.ts, pinned to a
+      # commit and checksum, so a change on either side fails this job.
+      - name: Fetch NANDA's checksum-pinned signing code
+        env:
+          NANDA_INDEX_COMMIT: fc9bc8bb9b15a4816123f2347feb25479d5b4ce8
+          SIGNING_TS_SHA256: e545d8e74bb15bc3dc3a0c19c4ae00f82978a5c039aab6ea083984da692152f3
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/interop/signing.ts" \
+            "https://raw.githubusercontent.com/projnanda/nanda-index-v2/${NANDA_INDEX_COMMIT}/server/src/services/signing.ts"
+          echo "${SIGNING_TS_SHA256}  $RUNNER_TEMP/interop/signing.ts" | sha256sum -c -
+          cp hack/nanda-interop/verify.ts "$RUNNER_TEMP/interop/"
+
+      - name: Verify with NANDA's implementation
+        run: |
+          docker run --rm --network none -v "$RUNNER_TEMP/interop:/w:ro" -w /w \
+            node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 \
+            node --experimental-strip-types --no-warnings verify.ts /w
