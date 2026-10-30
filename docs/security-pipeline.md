@@ -67,5 +67,5 @@ Static gates use the same pinned versions as CI, for example:
 
 ```bash
 go run github.com/securego/gosec/v2/cmd/gosec@v2.30.0 ./...
-go run github.com/google/osv-scanner/v2/cmd/osv-scanner@v2.7.0 scan source --recursive .
+osv-scanner scan source --recursive .   # v2.7.0 release binary; it needs Go 1.27 to build
 ```

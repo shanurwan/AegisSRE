@@ -142,16 +142,22 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: false
-
       # govulncheck (reachability-aware) runs in test.yml. These two flag any
       # known-vulnerable module version whether or not it is reachable.
+      # OSV-Scanner 2.7.0 needs Go 1.27 to build, so use the release binary.
+      - name: Install checksum-pinned OSV-Scanner
+        env:
+          OSV_SCANNER_VERSION: 2.7.0
+          OSV_SCANNER_SHA256: 160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  $RUNNER_TEMP/osv-scanner" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/osv-scanner"
+
       - name: OSV-Scanner
-        run: go run github.com/google/osv-scanner/v2/cmd/osv-scanner@v2.7.0 scan source --recursive .
+        run: |
+          "$RUNNER_TEMP/osv-scanner" scan source --recursive .
 
       - name: Trivy filesystem scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
