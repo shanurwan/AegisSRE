@@ -80,6 +80,9 @@ services:
       AEGIS_LLM_BASE_URL: "${AEGIS_LLM_BASE_URL:-}"
       AEGIS_LLM_API_KEY: "${AEGIS_LLM_API_KEY:-}"
       AEGIS_LLM_MODEL: "${AEGIS_LLM_MODEL:-}"
+      AEGIS_LLM_API: "${AEGIS_LLM_API:-responses}"
+      AEGIS_LLM_THINKING: "${AEGIS_LLM_THINKING:-}"
+      AEGIS_LLM_JSON_MODE: "${AEGIS_LLM_JSON_MODE:-schema}"
     networks: [observe]
     ports:
       - "127.0.0.1:8082:8080"

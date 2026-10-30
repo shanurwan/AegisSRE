@@ -278,3 +278,18 @@ func TestAgentFactsIdentityAndKeyAreConfiguredTogether(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestLLMWireAPIAndThinkingAreValidated(t *testing.T) {
+	t.Setenv("AEGIS_LLM_THINKING", "false")
+	if _, err := Load("investigator"); err == nil || !strings.Contains(err.Error(), "AEGIS_LLM_THINKING") {
+		t.Fatalf("thinking without chat_completions: %v", err)
+	}
+	t.Setenv("AEGIS_LLM_API", "chat_completions")
+	if _, err := Load("investigator"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AEGIS_LLM_API", "completions")
+	if _, err := Load("investigator"); err == nil || !strings.Contains(err.Error(), "AEGIS_LLM_API") {
+		t.Fatalf("unknown API accepted: %v", err)
+	}
+}
