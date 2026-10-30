@@ -82,3 +82,35 @@ func TestAgentCardNeverGrantsCredentialedCrossOriginReads(t *testing.T) {
 		}
 	}
 }
+
+func TestAgentFactsAreServedBesideTheCardOnlyWhenConfigured(t *testing.T) {
+	t.Parallel()
+	handle := func(context.Context, model.Envelope) (model.Envelope, error) { return model.Envelope{}, nil }
+	config := CardConfig{
+		Name: "test", Description: "test structured agent", PublicURL: "https://agent.example",
+		SkillID: "test", SkillName: "Test",
+	}
+	without, _, err := NewHandler(config, handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	without.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, AgentFactsPath, nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("AgentFacts served without configuration: HTTP %d", recorder.Code)
+	}
+
+	config.AgentFacts = []byte(`{"id":"urn:air:agent.example:agent:test"}`)
+	with, _, err := NewHandler(config, handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder = httptest.NewRecorder()
+	with.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, AgentFactsPath, nil))
+	if recorder.Code != http.StatusOK || recorder.Body.String() != string(config.AgentFacts) {
+		t.Fatalf("AgentFacts = HTTP %d %q", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q", got)
+	}
+}

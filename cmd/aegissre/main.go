@@ -16,13 +16,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/shanurwan/AegisSRE/internal/adapters/backend"
+	"github.com/shanurwan/AegisSRE/internal/adapters/discovery"
 	"github.com/shanurwan/AegisSRE/internal/adapters/fixture"
 	kubeadapter "github.com/shanurwan/AegisSRE/internal/adapters/kubernetes"
+	"github.com/shanurwan/AegisSRE/internal/adapters/nanda"
 	notificationadapter "github.com/shanurwan/AegisSRE/internal/adapters/notification"
 	postgresadapter "github.com/shanurwan/AegisSRE/internal/adapters/postgres"
 	reasoneradapter "github.com/shanurwan/AegisSRE/internal/adapters/reasoner"
@@ -45,7 +48,13 @@ import (
 	mcptransport "github.com/shanurwan/AegisSRE/internal/transport/mcp"
 )
 
-const version = "0.1.0"
+const (
+	version    = "0.1.0"
+	projectURL = "https://github.com/shanurwan/AegisSRE"
+
+	investigatorSkillID = "investigate-incident"
+	operatorSkillID     = "operate-remediation"
+)
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -95,7 +104,7 @@ Usage:
   aegissre operator
   aegissre mcp-server --profile=read|action
   aegissre migrate
-  aegissre keygen
+  aegissre keygen [-agentfacts]
   aegissre version
 
 Configuration is supplied through AEGIS_* environment variables. See
@@ -126,6 +135,7 @@ func runMigrations() error {
 func keygen(args []string) error {
 	flags := flag.NewFlagSet("keygen", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
+	agentFacts := flags.Bool("agentfacts", false, "generate an agent's AgentFacts signing key and the did:key its peers pin")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -135,6 +145,12 @@ func keygen(args []string) error {
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return fmt.Errorf("generate Ed25519 delegation key: %w", err)
+	}
+	if *agentFacts {
+		fmt.Fprintf(os.Stdout, "AEGIS_AGENTFACTS_PRIVATE_KEY=%s\n", security.EncodePrivateKeyBase64(privateKey))
+		fmt.Fprintf(os.Stdout, "# pin on Monitor as AEGIS_NANDA_INVESTIGATOR_KEY or AEGIS_NANDA_OPERATOR_KEY\n")
+		fmt.Fprintf(os.Stdout, "AGENTFACTS_DID_KEY=%s\n", nanda.DIDKey(publicKey))
+		return nil
 	}
 	fmt.Fprintf(os.Stdout, "AEGIS_DELEGATION_KEY_ID=%s\n", "aegissre-monitor-v1")
 	fmt.Fprintf(os.Stdout, "AEGIS_DELEGATION_PRIVATE_KEY=%s\n", security.EncodePrivateKeyBase64(privateKey))
@@ -253,6 +269,11 @@ func runMonitor(ctx context.Context, cfg config.Config, logger *slog.Logger) err
 	if err != nil {
 		return err
 	}
+	resolver, err := peerResolver(cfg)
+	if err != nil {
+		return err
+	}
+	peers = discovery.Messenger{Resolver: resolver, Next: peers}
 	auditor := ports.Auditor(audit.Logger{Log: logger})
 	var monitorState ports.MonitorStateStore
 	if pool != nil {
@@ -277,7 +298,7 @@ func runMonitor(ctx context.Context, cfg config.Config, logger *slog.Logger) err
 		AllowLogTraceActions: cfg.AllowLogTraceActions,
 		StateStore:           monitorState, InstanceID: runtimeInstanceID(cfg), StateLease: cfg.StateLease,
 	}
-	handler, _, err := a2atransport.NewHandler(a2atransport.CardConfig{
+	handler, _, err := newAgentHandler(cfg, a2atransport.CardConfig{
 		Name: "AegisSRE Monitor", Description: "Autonomously detects and verifies bounded reliability incidents",
 		PublicURL: cfg.PublicURL, SkillID: "monitor-incidents", SkillName: "Monitor incidents",
 		Examples:    []string{"Autonomously poll the configured deployment health rule"},
@@ -378,9 +399,9 @@ func runInvestigator(ctx context.Context, cfg config.Config, logger *slog.Logger
 		Tools: tools, Reasoner: reasoning, Clock: clock, IDs: ids,
 		Audit: audit.Logger{Log: logger}, MaxLogBytes: cfg.MaxLogBytes,
 	}
-	handler, _, err := a2atransport.NewHandler(a2atransport.CardConfig{
+	handler, _, err := newAgentHandler(cfg, a2atransport.CardConfig{
 		Name: "AegisSRE Investigator", Description: "Builds evidence-driven diagnoses through constrained read-only tools",
-		PublicURL: cfg.PublicURL, SkillID: "investigate-incident", SkillName: "Investigate incident",
+		PublicURL: cfg.PublicURL, SkillID: investigatorSkillID, SkillName: "Investigate incident",
 		Examples:    []string{"Diagnose a verified Deployment availability incident"},
 		RequireMTLS: cfg.MTLSEnabled,
 	}, service.Handle)
@@ -454,9 +475,9 @@ func runOperator(ctx context.Context, cfg config.Config, logger *slog.Logger) er
 	if executionStore == nil {
 		service.Replay = security.NewMemoryReplayGuard()
 	}
-	handler, _, err := a2atransport.NewHandler(a2atransport.CardConfig{
+	handler, _, err := newAgentHandler(cfg, a2atransport.CardConfig{
 		Name: "AegisSRE Operator", Description: "Executes only exact, signed, policy-approved remediation delegations",
-		PublicURL: cfg.PublicURL, SkillID: "operate-remediation", SkillName: "Operate remediation",
+		PublicURL: cfg.PublicURL, SkillID: operatorSkillID, SkillName: "Operate remediation",
 		Examples:    []string{"Execute an Ed25519-signed Deployment remediation grant"},
 		RequireMTLS: cfg.MTLSEnabled,
 	}, service.Handle)
@@ -773,6 +794,97 @@ func peerMessenger(cfg config.Config) (ports.PeerMessenger, error) {
 		clients[peer] = client
 	}
 	return a2atransport.NewAuthenticatedClient(clients), nil
+}
+
+// peerResolver decides where Monitor sends A2A messages: the configured
+// addresses, or peers resolved through the NANDA Index and verified against
+// their pinned AgentFacts keys.
+func peerResolver(cfg config.Config) (ports.PeerResolver, error) {
+	if cfg.Discovery != "nanda" {
+		return discovery.Static{
+			model.AgentInvestigator: cfg.InvestigatorURL,
+			model.AgentOperator:     cfg.OperatorURL,
+		}, nil
+	}
+	peers := make(map[model.AgentID]nanda.Peer, 2)
+	clients := make(map[model.AgentID]*http.Client, 2)
+	for agent, peer := range map[model.AgentID]struct{ id, key, skill string }{
+		model.AgentInvestigator: {cfg.NANDAInvestigatorID, cfg.NANDAInvestigatorKey, investigatorSkillID},
+		model.AgentOperator:     {cfg.NANDAOperatorID, cfg.NANDAOperatorKey, operatorSkillID},
+	} {
+		if _, err := nanda.PublisherDomain(peer.id); err != nil {
+			return nil, fmt.Errorf("NANDA identity for %s: %w", agent, err)
+		}
+		key, err := nanda.ParseDIDKey(peer.key)
+		if err != nil {
+			return nil, fmt.Errorf("pinned AgentFacts key for %s: %w", agent, err)
+		}
+		peers[agent] = nanda.Peer{ID: peer.id, Key: key, Skill: peer.skill}
+		client, err := authenticatedHTTPClient(cfg, agent)
+		if err != nil {
+			return nil, err
+		}
+		if client == nil {
+			client = observability.HTTPClient(httpclient.Direct(cfg.RequestTimeout))
+		}
+		clients[agent] = client
+	}
+	return &nanda.Resolver{
+		Index: nanda.IndexClient{
+			BaseURL:    cfg.NANDAIndexURL,
+			HTTPClient: observability.HTTPClient(httpclient.External(cfg.RequestTimeout)),
+		},
+		Peers:      peers,
+		PeerClient: func(agent model.AgentID) *http.Client { return clients[agent] },
+		AllowHTTP:  cfg.NANDAAllowHTTP,
+		TTL:        cfg.NANDACacheTTL,
+	}, nil
+}
+
+// newAgentHandler builds an A2A handler and, when an AgentFacts identity is
+// configured, publishes a signed AgentFacts document beside its Agent Card.
+func newAgentHandler(cfg config.Config, card a2atransport.CardConfig, handle a2atransport.Handler) (http.Handler, *a2a.AgentCard, error) {
+	if cfg.AgentFactsID != "" {
+		facts, err := signedAgentFacts(cfg, card)
+		if err != nil {
+			return nil, nil, err
+		}
+		card.AgentFacts = facts
+	}
+	return a2atransport.NewHandler(card, handle)
+}
+
+func signedAgentFacts(cfg config.Config, card a2atransport.CardConfig) ([]byte, error) {
+	var (
+		key ed25519.PrivateKey
+		err error
+	)
+	if cfg.AgentFactsPrivateKeyFile != "" {
+		key, err = security.LoadPrivateKeyFile(cfg.AgentFactsPrivateKeyFile)
+	} else {
+		key, err = security.ParsePrivateKeyBase64(cfg.AgentFactsPrivateKey)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("AgentFacts signing key: %w", err)
+	}
+	if _, err := nanda.PublisherDomain(cfg.AgentFactsID); err != nil {
+		return nil, fmt.Errorf("AEGIS_AGENTFACTS_ID: %w", err)
+	}
+	authentication := []string{"none"}
+	if card.RequireMTLS {
+		authentication = []string{"mtls"}
+	}
+	modes := []string{"application/json"}
+	return nanda.Sign(nanda.Facts{
+		ID: cfg.AgentFactsID, AgentName: card.Name, Label: card.Name, Description: card.Description,
+		Version: version, DocumentationURL: projectURL,
+		Provider:  nanda.Provider{Name: "AegisSRE", URL: projectURL},
+		Endpoints: nanda.Endpoints{Static: []string{card.PublicURL + "/a2a"}},
+		Capabilities: nanda.Capabilities{
+			Modalities: modes, Authentication: nanda.Authentication{Methods: authentication},
+		},
+		Skills: []nanda.Skill{{ID: card.SkillID, Description: card.Description, InputModes: modes, OutputModes: modes}},
+	}, key)
 }
 
 func authenticatedHTTPClient(cfg config.Config, recipient model.AgentID) (*http.Client, error) {

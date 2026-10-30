@@ -225,3 +225,56 @@ func TestInstanceIDIsBounded(t *testing.T) {
 		t.Fatalf("Validate() error = %v, want bounded instance ID rejection", err)
 	}
 }
+
+func TestDiscoveryDefaultsToStaticAddresses(t *testing.T) {
+	cfg, err := Load("monitor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Discovery != "static" || cfg.AgentFactsID != "" {
+		t.Fatalf("discovery = %q, AgentFacts = %q; NANDA must be opt-in", cfg.Discovery, cfg.AgentFactsID)
+	}
+}
+
+func TestNANDADiscoveryRequiresPinnedPeerIdentities(t *testing.T) {
+	setNANDA := func(t *testing.T) {
+		t.Setenv("AEGIS_DISCOVERY", "nanda")
+		t.Setenv("AEGIS_NANDA_INVESTIGATOR_ID", "urn:air:aegis.example.org:agent:investigator")
+		t.Setenv("AEGIS_NANDA_OPERATOR_ID", "urn:air:aegis.example.org:agent:operator")
+		t.Setenv("AEGIS_NANDA_INVESTIGATOR_KEY", "did:key:zaaaaaaaaaaaaaaaa")
+		t.Setenv("AEGIS_NANDA_OPERATOR_KEY", "did:key:zbbbbbbbbbbbbbbbb")
+	}
+	t.Run("complete", func(t *testing.T) {
+		setNANDA(t)
+		if _, err := Load("monitor"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	tests := map[string]func(*testing.T){
+		"AEGIS_DISCOVERY":              func(t *testing.T) { t.Setenv("AEGIS_DISCOVERY", "dns") },
+		"AEGIS_NANDA_OPERATOR_ID":      func(t *testing.T) { t.Setenv("AEGIS_NANDA_OPERATOR_ID", "https://operator.example") },
+		"AEGIS_NANDA_INVESTIGATOR_KEY": func(t *testing.T) { t.Setenv("AEGIS_NANDA_INVESTIGATOR_KEY", "") },
+		"AEGIS_NANDA_INDEX_URL":        func(t *testing.T) { t.Setenv("AEGIS_NANDA_INDEX_URL", "http://index.example") },
+		"AEGIS_NANDA_CACHE_TTL":        func(t *testing.T) { t.Setenv("AEGIS_NANDA_CACHE_TTL", "1s") },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			setNANDA(t)
+			mutate(t)
+			if _, err := Load("monitor"); err == nil || !strings.Contains(err.Error(), name) {
+				t.Fatalf("Load(monitor) error = %v, want a %s error", err, name)
+			}
+		})
+	}
+}
+
+func TestAgentFactsIdentityAndKeyAreConfiguredTogether(t *testing.T) {
+	t.Setenv("AEGIS_AGENTFACTS_ID", "urn:air:aegis.example.org:agent:investigator")
+	if _, err := Load("investigator"); err == nil || !strings.Contains(err.Error(), "AEGIS_AGENTFACTS_ID") {
+		t.Fatalf("Load(investigator) error = %v, want an AgentFacts key error", err)
+	}
+	t.Setenv("AEGIS_AGENTFACTS_PRIVATE_KEY", "c2VlZA")
+	if _, err := Load("investigator"); err != nil {
+		t.Fatal(err)
+	}
+}

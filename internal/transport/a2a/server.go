@@ -26,7 +26,13 @@ type CardConfig struct {
 	SkillName   string
 	Examples    []string
 	RequireMTLS bool
+	// AgentFacts, when set, is a signed AgentFacts document served beside the
+	// Agent Card at AgentFactsPath for NANDA discovery.
+	AgentFacts []byte
 }
+
+// AgentFactsPath is where a signed AgentFacts document is published.
+const AgentFactsPath = "/agentfacts.json"
 
 type executor struct {
 	handle      Handler
@@ -147,6 +153,14 @@ func NewHandler(config CardConfig, handle Handler) (http.Handler, *a2a.AgentCard
 	)
 	mux := http.NewServeMux()
 	mux.Handle(a2asrv.WellKnownAgentCardPath, publicDocument(a2asrv.NewStaticAgentCardHandler(card)))
+	if len(config.AgentFacts) > 0 {
+		facts := append([]byte(nil), config.AgentFacts...)
+		mux.Handle("GET "+AgentFactsPath, http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Header().Set("Access-Control-Allow-Origin", "*")
+			_, _ = writer.Write(facts)
+		}))
+	}
 	rpc := a2asrv.NewJSONRPCHandler(requestHandler)
 	mux.Handle("/a2a", http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		request.Body = http.MaxBytesReader(writer, request.Body, 1<<20)
