@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-ARG GO_VERSION=1.26.8
+ARG GO_VERSION=1.26.10
 # Keep GO_VERSION and this digest in lockstep. The digest makes the build input
 # immutable even if the upstream convenience tag moves.
-FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm@sha256:a688600ca24f8a4d3ca77f95b0dd40704a9fc787c826660eb7ba0b641b8b175d AS build
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm@sha256:23ce71337b726608afb1bc00986e630a05034a87a87ea1fc2cd1ae5cf33387eb AS build
 
 WORKDIR /src
 
