@@ -52,6 +52,16 @@ Monitor is schedule-driven: it scans immediately at startup and then every `AEGI
 
 SDK versions are pinned in [`go.mod`](go.mod). Protocol conformance is a separate claim and must be demonstrated by tests; importing an SDK alone is not evidence of conformance.
 
+## NANDA discovery
+
+Monitor can find its peers through the [Project NANDA](https://projectnanda.org) Index instead of fixed addresses (`AEGIS_DISCOVERY=nanda`). Each agent publishes an AgentFacts document beside its Agent Card, signed with Ed25519 over the Index's own canonical-JSON recipe and naming its key as a `did:key`. Before sending anything, Monitor resolves the peer's `urn:air:` identifier and requires:
+
+- an exact, active Index entry for an A2A Agent Card, on a verified domain;
+- a card on that domain that exposes JSON-RPC at its own origin and the expected role skill;
+- AgentFacts signed by the key Monitor pins for that peer, naming the same identity, skill and endpoint.
+
+The Index says where a peer is; the pinned key says who answered. Discovery never grants authority: the delegation grant, mTLS and workload policy still decide what happens. A CI job verifies AegisSRE's signed AgentFacts with NANDA's unmodified TypeScript signing code, and end-to-end tests show an impostor with a valid Index entry never receives a message. Static addresses remain the default. See [NANDA discovery](docs/nanda.md).
+
 ## Tool surface
 
 The typed contracts live under `internal/toolapi`. The initial bounded catalog is:
@@ -182,6 +192,7 @@ The dependency rule points inward: domain and application code must not import H
 - [Architecture](docs/architecture.md)
 - [Security model](docs/security-model.md)
 - [Security pipeline](docs/security-pipeline.md): secrets, SAST, dependency, container, IaC, CI/CD, DAST and IAST gates
+- [NANDA discovery](docs/nanda.md): signed AgentFacts, NANDA Index resolution and peer verification
 - [Deployment](docs/deployment.md)
 - [Local demo](docs/demo.md)
 - [Operations runbook](docs/runbook.md)
