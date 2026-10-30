@@ -99,10 +99,10 @@ In mTLS mode Monitor fetches each peer's card and AgentFacts with that peer's mu
 For each agent, create an entry on the Index you use (the public one at [nandaindex.org](https://nandaindex.org), or a self-hosted `nanda-index-v2`):
 
 1. Create and verify an account (`POST /auth/register`, then the emailed verification link).
-2. `POST /api/v1/orgs` with `hosting_path: "smb"`, `domain: "<your domain>"`, `identifier: "urn:air:<your domain>:agent:<name>"`, `media_type: "application/a2a-agent-card+json"` and `registry_url` set to the agent's `https://…/.well-known/agent-card.json`.
-3. Prove the domain: `POST /api/v1/orgs/<org_id>/domain-challenge`, publish the TXT record, then `POST …/verify-domain`.
+2. `POST /api/v1/orgs` with `hosting_path: "smb"`, `domain: "<agent>.<your domain>"`, `identifier: "urn:air:<agent>.<your domain>:agent:<agent>"`, `media_type: "application/a2a-agent-card+json"` and `registry_url` set to the agent's `https://…/.well-known/agent-card.json`.
+3. Prove the domain: `POST /api/v1/orgs/<org_id>/domain-challenge`, publish the returned TXT record at `_nanda-challenge.<agent>.<your domain>`, then `POST …/verify-domain`.
 
-The Agent Card host must be the verified domain or a subdomain of it. Monitor rejects an entry whose domain is unverified.
+The Index allows one verified entry per domain (`uq_organizations_verified_domain`), so give each agent its own subdomain, as above. The Agent Card host must be the verified domain or a subdomain of it, and Monitor rejects an entry whose domain is unverified. Until the domain is proven the Index does not resolve the entry at all.
 
 ## Network policy
 
@@ -115,11 +115,12 @@ The base Kubernetes NetworkPolicies do not allow Monitor to reach an external In
 | Canonical bytes and signatures match NANDA's implementation | `nanda-interop` job in [`test.yml`](../.github/workflows/test.yml): AegisSRE signs AgentFacts, the unmodified nanda-index-v2 `signing.ts` (pinned commit and SHA-256) verifies them, rejects a tampered copy, and reproduces the exact bytes |
 | Monitor completes an incident with peers found only through the Index | `TestE2EMonitorDiscoversVerifiedPeersThroughNANDAIndex`: real A2A and MCP servers, an Index serving the nanda-index-v2 resolve shape, static addresses deliberately unusable |
 | An impostor never receives a grant | `TestE2EPeerWithUnpinnedAgentFactsKeyNeverReceivesAGrant`: valid Index entry and card, AgentFacts signed by an unpinned key, zero messages reach it |
+| It works against a real nanda-index-v2 | [`examples/nanda`](../examples/nanda/README.md), run on 30 October 2026 against nanda-index-v2 `fc9bc8b`: entries registered through its API, unresolvable until domain-verified, then the five-container topology completed an incident with Monitor's static addresses set to `http://static.invalid` (one Index resolve per peer). Re-pinning the Operator to the wrong `did:key` escalated the incident with `AgentFacts is signed by a key other than the pinned key`, and Operator received no request |
 | Each verification rule fails closed | `internal/adapters/nanda/resolver_test.go`: publisher-level match, wrong type, suspended, unverified domain, host outside domain, redirect, missing skill, foreign endpoint, wrong key, wrong id |
 
 ## Limits
 
-- The end-to-end tests use an in-process Index that serves the nanda-index-v2 response format, not a running nanda-index-v2 server. Registration against a live Index is a manual step today.
+- CI runs the end-to-end tests against an in-process Index in the nanda-index-v2 response format. The run against a real nanda-index-v2 is the documented [example](../examples/nanda/README.md), not a CI job, and it used a reserved `.test` domain activated through the Index's documented test shortcut instead of DNS.
 - AgentFacts signing here is AegisSRE's proposal on top of the NANDA format, not a NANDA standard. If NANDA standardizes a different signature layout, the adapter will follow it.
 - Discovery covers Monitor's A2A peers. Investigator and Operator reach their MCP servers through configured addresses, which stay inside the deployment.
 
