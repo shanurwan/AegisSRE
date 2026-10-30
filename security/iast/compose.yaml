@@ -1,0 +1,18 @@
+# IAST overlay for the fixture topology: run the race- and coverage-
+# instrumented build with the same hardened runtime settings as compose.yaml.
+#   docker compose -f compose.yaml -f security/iast/compose.yaml up --no-build
+# Relative paths resolve against the project directory (the first file).
+x-iast: &iast
+  image: aegissre:iast
+  environment:
+    GOCOVERDIR: /coverage
+    GORACE: halt_on_error=0 log_path=/coverage/race
+  volumes:
+    - ./build/iast:/coverage
+
+services:
+  aegis-mcp-read: *iast
+  aegis-mcp-action: *iast
+  aegis-investigator: *iast
+  aegis-operator: *iast
+  aegis-monitor: *iast

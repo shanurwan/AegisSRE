@@ -43,7 +43,7 @@ type Backend struct {
 const maxFixtureDetectionCount = 1<<53 - 1
 
 func Load(path string) (*Backend, error) {
-	contents, err := os.ReadFile(path)
+	contents, err := os.ReadFile(path) // #nosec G304 -- operator-configured path, never request input
 	if err != nil {
 		return nil, fmt.Errorf("read fixture %s: %w", path, err)
 	}

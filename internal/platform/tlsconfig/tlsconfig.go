@@ -234,7 +234,7 @@ func readBounded(path string) ([]byte, error) {
 	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxCredentialFileSize {
 		return nil, errors.New("credential file is empty, oversized, or not regular")
 	}
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- operator-configured path, never request input
 	if err != nil {
 		return nil, err
 	}

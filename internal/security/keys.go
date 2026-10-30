@@ -77,7 +77,7 @@ func LoadPrivateKeyFile(path string) (ed25519.PrivateKey, error) {
 	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxPrivateKeyFileSize {
 		return nil, errors.New("Ed25519 private-key file is empty, oversized, or not regular")
 	}
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- operator-configured path, never request input
 	if err != nil {
 		return nil, fmt.Errorf("read Ed25519 private-key file: %w", err)
 	}

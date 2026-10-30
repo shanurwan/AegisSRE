@@ -144,7 +144,7 @@ func LoadPublicKeyringFile(path string) (map[string]ed25519.PublicKey, error) {
 	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxPublicKeyringSize {
 		return nil, errors.New("public verification keyring file is empty, oversized, or not regular")
 	}
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- operator-configured path, never request input
 	if err != nil {
 		return nil, fmt.Errorf("read public verification keyring: %w", err)
 	}

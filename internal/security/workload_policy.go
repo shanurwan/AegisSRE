@@ -104,7 +104,7 @@ func LoadWorkloadPolicy(path string) (WorkloadPolicyDocument, error) {
 	if path == "" {
 		return WorkloadPolicyDocument{}, model.NewError(model.CodeInvalidInput, "workload policy path is required")
 	}
-	file, err := os.Open(path)
+	file, err := os.Open(path) // #nosec G304 -- operator-configured path, never request input
 	if err != nil {
 		return WorkloadPolicyDocument{}, fmt.Errorf("open workload policy: %w", err)
 	}
