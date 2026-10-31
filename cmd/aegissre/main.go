@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -653,12 +654,20 @@ func operateBackend(
 }
 
 func actionPolicy(cfg config.Config) (*security.Policy, error) {
+	maximumReplicas, err := boundedInt32("AEGIS_MAX_SCALE_REPLICAS", cfg.MaxScaleReplicas)
+	if err != nil {
+		return nil, err
+	}
+	maximumIncrease, err := boundedInt32("AEGIS_MAX_SCALE_INCREASE", cfg.MaxScaleIncrease)
+	if err != nil {
+		return nil, err
+	}
 	policyConfig := security.PolicyConfig{
 		AllowedNamespaces: []string{cfg.AllowedNamespace},
 		AllowedActions:    []model.ActionKind{model.ActionRestartDeployment, model.ActionScaleDeployment},
 		MinimumConfidence: 0.8, MinimumEvidence: 1,
 		MaximumGrantTTL: cfg.DelegationTTL, RequireDryRun: cfg.DryRun,
-		MaximumReplicas: int32(cfg.MaxScaleReplicas), MaximumReplicaIncrease: int32(cfg.MaxScaleIncrease), // #nosec G115 -- Config.Validate bounds both to [1,1000]
+		MaximumReplicas: maximumReplicas, MaximumReplicaIncrease: maximumIncrease,
 	}
 	if cfg.WorkloadPolicyPath != "" {
 		document, err := security.LoadWorkloadPolicy(cfg.WorkloadPolicyPath)
@@ -935,6 +944,15 @@ func workloadIdentities(cfg config.Config) map[model.AgentID]string {
 	}
 }
 
+// boundedInt32 narrows a positive configuration value. Config.Validate already
+// enforces tighter limits; this keeps each conversion safe where it happens.
+func boundedInt32(name string, value int) (int32, error) {
+	if value < 1 || value > math.MaxInt32 {
+		return 0, fmt.Errorf("%s is out of range: %d", name, value)
+	}
+	return int32(value), nil
+}
+
 func openPostgres(ctx context.Context, cfg config.Config, checkSchema bool) (*pgxpool.Pool, error) {
 	databaseURL, err := configuredDatabaseURL(cfg)
 	if err != nil {
@@ -950,7 +968,11 @@ func openPostgres(ctx context.Context, cfg config.Config, checkSchema bool) (*pg
 	if err := validatePostgresTransport(cfg, poolConfig); err != nil {
 		return nil, err
 	}
-	poolConfig.MaxConns = int32(cfg.DatabaseMaxConnections) // #nosec G115 -- Config.Validate bounds this to [1,50]
+	maxConns, err := boundedInt32("AEGIS_DATABASE_MAX_CONNECTIONS", cfg.DatabaseMaxConnections)
+	if err != nil {
+		return nil, err
+	}
+	poolConfig.MaxConns = maxConns
 	poolConfig.MinConns = 1
 	poolConfig.MaxConnLifetime = 30 * time.Minute
 	poolConfig.MaxConnIdleTime = 5 * time.Minute
