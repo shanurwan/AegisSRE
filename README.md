@@ -8,10 +8,6 @@ The safety boundary is deliberate: diagnosis does not imply permission, and perm
 
 > **Project status:** pre-release. The control plane, strict workload mTLS, exact workload policy binding, overlapping delegation-key verification, OTLP trace export, and PostgreSQL-backed Monitor/execution/audit/report-outbox paths are implemented and tested in repository scope. Deterministic E2E tests cross real MCP, A2A, and notification HTTP boundaries; PostgreSQL integration tests exercise competing owners, replay recovery, leases, and outbox transitions against a real PostgreSQL service in CI. Production images, certificates/secrets, external HA PostgreSQL, authoritative collector identity enrichment, and restricted WhatsApp egress are not provisioned by this repository.
 
-## Breach AegisSRE
-
-[`demo/`](demo/) is a 3D game: you play the attacker against the three agents and try eight real attacks: prompt injection through logs, a hijacked target, a forged grant, an edited grant, replay, an expired grant, a stale world, and impersonating Operator through NANDA. For each one you predict which defence stops it, then watch it get stopped. Every outcome on screen is recorded by [`hack/breach`](hack/breach/main.go), which runs the attack against the real action plane, reasoner and NANDA resolver. A test fails if the recorded file and the code ever disagree, and the deploy workflow runs that test before publishing.
-
 ## System shape
 
 ```text
@@ -129,8 +125,6 @@ The equivalent multi-process startup is:
 docker compose up --build
 ```
 
-See [the demo guide](docs/demo.md) for the implemented fixture workflow and its validation limits.
-
 ## Production controls
 
 The production and laboratory overlays add controls intentionally omitted from the local fixture topology:
@@ -143,21 +137,6 @@ The production and laboratory overlays add controls intentionally omitted from t
 - OTLP/HTTP trace export to the in-cluster collector plus default-deny, destination-specific NetworkPolicies.
 
 The production overlay is a deliberately non-deployable scaffold: its zero image digest and `replace-before-live` workload must be replaced. The laboratory overlays bind policy and RBAC to the single `aegissre-e2e-canary`. Render and validate them with `make manifest-policy-overlays`; the live runner additionally requires the exact `laboratory` context, `outage-arena` namespace, canary name, pinned image digest, and explicit acknowledgement. It is never run by ordinary CI.
-
-## Outage Arena integration
-
-The target k3s environment exposes these telemetry endpoints:
-
-| Signal | In-cluster endpoint | Notes |
-|---|---|---|
-| Metrics | `http://vmsingle.observability.svc.cluster.local:8428` | VictoriaMetrics; Prometheus-compatible query API, 30-day retention in the current arena configuration |
-| Logs | `http://vlogs.observability.svc.cluster.local:9428` | VictoriaLogs; cluster pod logs, 14-day retention |
-| Traces | `http://vtraces.observability.svc.cluster.local:10428` | VictoriaTraces; AegisSRE appends the bounded LogsQL stats API path, 7-day retention |
-| OTLP | `http://otel-collector.observability.svc.cluster.local:4318` | HTTP OTLP ingress; gRPC is available on port `4317` |
-
-The read MCP consumes VictoriaMetrics, VictoriaLogs, and VictoriaTraces. Exact workload policy filters autonomous observations to configured targets and signal sources. Log detection still requires the canonical `aegissre.io/workload` identity in the collected stream, and trace detection requires `k8s.namespace.name` plus `k8s.deployment.name` resource attributes. Missing or mismatched identity fails closed. The sibling outage-arena collector may not yet add those authoritative attributes, so validate or enrich that independently owned pipeline before relying on log/trace incidents. AegisSRE exports its own traces through OTLP when the standard endpoint variables are configured; it does not export application logs a second time.
-
-The arena currently has no workload scenarios or alert rules under `apps/laboratory`; AegisSRE must not imply otherwise. Deployment also requires infra-owned read RBAC for cluster evidence and a separate, minimal action Role in `outage-arena`. Details are in [deployment](docs/deployment.md).
 
 ## Safety defaults
 
