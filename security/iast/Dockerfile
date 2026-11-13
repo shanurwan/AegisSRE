@@ -20,7 +20,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     -cover -covermode=atomic -coverpkg=./... \
     -o /out/aegissre ./cmd/aegissre
 
-FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 COPY --from=build /out/aegissre /usr/local/bin/aegissre
 
